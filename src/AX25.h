@@ -22,6 +22,10 @@ struct AX25Msg;
 
 typedef void (*ax25_callback_t)(struct AX25Msg *msg);
 
+// Hook para trama AX.25 cruda (sin CRC). Si está configurado, ax25_poll()
+// lo llama en lugar de ax25_decode(), lo que permite modo KISS TNC genérico.
+typedef void (*ax25_raw_callback_t)(const uint8_t *buf, size_t len);
+
 typedef struct AX25Ctx {
     uint8_t buf[AX25_MAX_FRAME_LEN];
     FILE *ch;
@@ -29,6 +33,7 @@ typedef struct AX25Ctx {
     uint16_t crc_in;
     uint16_t crc_out;
     ax25_callback_t hook;
+    ax25_raw_callback_t raw_hook;  // NULL = modo APRS; !=NULL = modo KISS TNC
     bool sync;
     bool escape;
 } AX25Ctx;

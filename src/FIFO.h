@@ -8,8 +8,8 @@ typedef struct FIFOBuffer
 {
   unsigned char *begin;
   unsigned char *end;
-  unsigned char * volatile head;
-  unsigned char * volatile tail;
+  unsigned char *head;
+  unsigned char *tail;
 } FIFOBuffer;
 
 inline bool fifo_isempty(const FIFOBuffer *f) {

@@ -66,10 +66,15 @@ void ax25_poll(AX25Ctx *ctx) {
         if (!ctx->escape && c == HDLC_FLAG) {
             if (ctx->frame_len >= AX25_MIN_FRAME_LEN) {
                 if (ctx->crc_in == AX25_CRC_CORRECT) {
-                    if(LibAPRS_open_squelch) {
-                        // LED_RX_ON();
+                    if (ctx->raw_hook) {
+                        // Modo KISS TNC: pasar trama cruda sin los 2 bytes de CRC
+                        ctx->raw_hook(ctx->buf, ctx->frame_len - 2);
+                    } else {
+                        if(LibAPRS_open_squelch) {
+                            // LED_RX_ON();
+                        }
+                        ax25_decode(ctx);
                     }
-                    ax25_decode(ctx);
                 }
             }
             ctx->sync = true;

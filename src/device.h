@@ -28,18 +28,17 @@
 
 #endif
 
-
 #define GPIO_AUDIO_TRIGGER GPIO_NUM_37
 // Audio input pin is controlled by I2S_ADC_CHANNEL below.
 // Audio output pin is ...hardcoded as GPIO 25?
-#define GPIO_PTT_OUT GPIO_NUM_33
+#define GPIO_PTT_OUT GPIO_NUM_26
 #define ESP_INTR_FLAG_DEFAULT 0
 
 
 //i2s number
 #define TNC_I2S_NUM           I2S_NUM_0
-#define DESIRED_SAMPLE_RATE   (13200)
-#define OVERSAMPLING          (8)
+#define DESIRED_SAMPLE_RATE   (9600)
+#define OVERSAMPLING          (5)
 //i2s sample rate
 #define TNC_I2S_SAMPLE_RATE   (DESIRED_SAMPLE_RATE * OVERSAMPLING)
 #define CONFIG_AFSK_DAC_SAMPLERATE (TNC_I2S_SAMPLE_RATE)
@@ -54,7 +53,11 @@
 #define TNC_I2S_CHANNEL_NUM   (1)
 
 //I2S built-in ADC unit
-#define I2S_ADC_UNIT              ADC_UNIT_1
-#define I2S_ADC_CHANNEL           ADC1_CHANNEL_0
+// Entrada de audio: GPIO 35 (ADC1_CHANNEL_7) y salida en GPIO 25 (DAC1) de la ESP32.
+// Se usa ADC1 (no ADC2) porque ADC2 entra en conflicto con Wi-Fi.
+#define AUDIO_ADC_UNIT            ADC_UNIT_1
+#define AUDIO_ADC_CHANNEL         ADC_CHANNEL_7
+#define AUDIO_ADC_ATTEN           ADC_ATTEN_DB_12   // rango ~0..3,1 V
+#define AUDIO_ADC_BITWIDTH        ADC_BITWIDTH_12   // 0..4095
 
 #define KEEP_RECORDING_THRESH  (5)

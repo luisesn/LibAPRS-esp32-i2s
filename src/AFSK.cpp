@@ -4,27 +4,40 @@
 #include "FakeArduino.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/dac_continuous.h"
+#include "esp_adc/adc_continuous.h"
 #include "driver/gpio.h"
-#include "driver/i2s.h"
 #include "esp_log.h"
+#include <math.h>
 
 extern unsigned long custom_preamble;
 extern unsigned long custom_tail;
 extern int LibAPRS_vref;
-extern bool LibAPRS_open_squelch;
 
-bool hw_afsk_dac_isr = false;
-bool hw_5v_ref = false;
+
 Afsk *AFSK_modem;
 
-static xQueueHandle gpio_evt_queue = NULL;
+// Definición requerida por las macros AFSK_DAC_IRQ_START/STOP en AFSK.h.
+// En el puerto AVR original habilitaba el ISR de DAC; aquí solo indica
+// si el generador de muestras está activo (no se consulta actualmente,
+// pero la variable debe existir para que linkee).
+bool hw_afsk_dac_isr = false;
 
-uint16_t audio_buf1[TNC_I2S_BUFLEN];
-uint16_t audio_buf2[TNC_I2S_BUFLEN];
+static dac_continuous_handle_t dac_handle;
+static adc_continuous_handle_t adc_handle;
+static bool dac_enabled = false;
+// true while DAC is active (TX); receive_audio_task pauses during this time.
+static volatile bool tx_mode = false;
 
-#define FULL_BUF_LEN (DESIRED_SAMPLE_RATE * 2)
-int8_t audio_buf_full[FULL_BUF_LEN];
-size_t audio_buf_full_idx = 0;
+// Pico absoluto de la última muestra decimada; lo lee y resetea audio_level_task.
+volatile int8_t audio_peak = 0;
+
+// Tamaño del chunk DMA leído por iteración. A 48 kHz, 1024 muestras = ~21 ms,
+// suficientemente pequeño para latencia baja y suficientemente grande para amortizar
+// la sobrecarga de FreeRTOS por `adc_continuous_read`.
+#define ADC_FRAME_SIZE        1024
+#define ADC_FRAMES_IN_POOL    4
+#define ADC_READ_BUF_BYTES    (ADC_FRAME_SIZE * SOC_ADC_DIGI_RESULT_BYTES)
 
 
 // Forward declerations
@@ -33,63 +46,95 @@ void afsk_putchar(char c);
 void receive_audio_task(void *arg);
 
 void AFSK_hw_refDetect(void) {
-    // This is manual for now
-    if (LibAPRS_vref == REF_5V) {
-        hw_5v_ref = true;
-    } else {
-        hw_5v_ref = false;
-    }
+    // TODO quitar
 }
 
-static void IRAM_ATTR gpio_isr_handler(void* arg)
-{
-    uint32_t gpio_num = (uint32_t) arg;
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+// En ESP32 clásico, dac_continuous y adc_continuous comparten el periférico I2S0
+// internamente, por lo que no pueden estar activos al mismo tiempo.
+// Usamos conmutación half-duplex: el ADC corre durante RX y el DAC durante TX.
+
+static void adc_peripheral_start(void) {
+    adc_continuous_handle_cfg_t handle_cfg = {
+        .max_store_buf_size = ADC_READ_BUF_BYTES * ADC_FRAMES_IN_POOL,
+        .conv_frame_size    = ADC_READ_BUF_BYTES,
+        .flags              = {},
+    };
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &adc_handle));
+
+    adc_digi_pattern_config_t adc_pattern = {
+        .atten     = AUDIO_ADC_ATTEN,
+        .channel   = AUDIO_ADC_CHANNEL,
+        .unit      = AUDIO_ADC_UNIT,
+        .bit_width = AUDIO_ADC_BITWIDTH,
+    };
+    adc_continuous_config_t dig_cfg = {
+        .pattern_num    = 1,
+        .adc_pattern    = &adc_pattern,
+        .sample_freq_hz = TNC_I2S_SAMPLE_RATE,
+        .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
+        .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+    };
+    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
+    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
+}
+
+// Cede I2S0 del ADC al DAC para poder transmitir.
+static void switch_to_tx(void) {
+    tx_mode = true;
+    // adc_continuous_stop desbloquea cualquier adc_continuous_read pendiente.
+    adc_continuous_stop(adc_handle);
+    // Esperamos a que receive_audio_task salga del read y vea tx_mode=true.
+    vTaskDelay(pdMS_TO_TICKS(30));
+    ESP_ERROR_CHECK(adc_continuous_deinit(adc_handle));
+    adc_handle = NULL;
+
+    dac_continuous_config_t dac_cfg = {
+        .chan_mask = DAC_CHANNEL_MASK_CH0,
+        .desc_num  = 4,
+        .buf_size  = 2048,
+        .freq_hz   = CONFIG_AFSK_DAC_SAMPLERATE,
+        .offset    = 0,
+        .clk_src   = DAC_DIGI_CLK_SRC_DEFAULT,
+        .chan_mode  = DAC_CHANNEL_MODE_SIMUL,
+    };
+    ESP_ERROR_CHECK(dac_continuous_new_channels(&dac_cfg, &dac_handle));
+
+    // SIMUL mode configura I2S en estéreo (L→DAC2=GPIO26, R→DAC1=GPIO25).
+    // Reafirmar GPIO26 como salida digital para que PTT siga siendo controlable.
+    gpio_set_direction(GPIO_PTT_OUT, GPIO_MODE_OUTPUT);
+}
+
+// Devuelve I2S0 al ADC tras finalizar la transmisión.
+static void switch_to_rx(void) {
+    if (dac_enabled) {
+        dac_continuous_disable(dac_handle);
+        dac_enabled = false;
+    }
+    ESP_ERROR_CHECK(dac_continuous_del_channels(dac_handle));
+    dac_handle = NULL;
+
+    adc_peripheral_start();
+    tx_mode = false;
 }
 
 void AFSK_hw_init(void) {
-    // Configure audio input trigger pin
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_INTR_POSEDGE;
-    io_conf.pin_bit_mask = (1ULL<<GPIO_AUDIO_TRIGGER);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    gpio_config(&io_conf);
-
-    // Configure PTT output
-    gpio_set_direction(GPIO_PTT_OUT, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_PTT_OUT, 1);
-
-    //create a queue to handle gpio event from isr
-    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
-    //start gpio task
-    xTaskCreate(receive_audio_task, "receive_audio_task", 2048, NULL, 10, NULL);
-
-    //install gpio isr service
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-    //hook isr handler for specific gpio pin
-    gpio_isr_handler_add(GPIO_AUDIO_TRIGGER, gpio_isr_handler, (void*) GPIO_AUDIO_TRIGGER);
-
-    i2s_port_t i2s_num = TNC_I2S_NUM;
-    i2s_config_t i2s_config = {
-       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN | I2S_MODE_ADC_BUILT_IN),
-       .sample_rate =  TNC_I2S_SAMPLE_RATE,
-       .bits_per_sample = TNC_I2S_SAMPLE_BITS,
-       .channel_format = TNC_I2S_FORMAT,
-       .communication_format = I2S_COMM_FORMAT_I2S_MSB,
-       .intr_alloc_flags = 0,
-       .dma_buf_count = 2,
-       .dma_buf_len = 300,
-       // .use_apll = 1,
-       .use_apll = 0,
+    // PTT como salida (activo alto: 1 = TX, 0 = reposo). Inicialmente en reposo.
+    gpio_config_t ptt_cfg = {
+        .pin_bit_mask = 1ULL << GPIO_PTT_OUT,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
-    //install and start i2s driver
-    i2s_driver_install(i2s_num, &i2s_config, 0, NULL);
-    //init DAC pad
-    i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
-    //init ADC pad
-    i2s_set_adc_mode(I2S_ADC_UNIT, I2S_ADC_CHANNEL);
-    adc1_config_channel_atten(I2S_ADC_CHANNEL, ADC_ATTEN_DB_11);
+    ESP_ERROR_CHECK(gpio_config(&ptt_cfg));
+    gpio_set_level(GPIO_PTT_OUT, 0);  // reposo: activo alto → 0 = sin TX
+
+    // Arrancamos solo el ADC continuo (I2S0 en modo ADC DMA).
+    // El DAC se inicializa bajo demanda en switch_to_tx().
+    adc_peripheral_start();
+
+    // Tarea de recepción en streaming continuo.
+    xTaskCreate(receive_audio_task, "receive_audio_task", 4096, NULL, 10, NULL);
 }
 
 void AFSK_init(Afsk *afsk) {
@@ -130,39 +175,30 @@ static void AFSK_txStart(Afsk *afsk) {
 }
 
 #define TX_SAMPLE_BUFLEN (8 * CONFIG_AFSK_DAC_SAMPLERATE / BITRATE)
-static uint16_t tx_sample_buf[TX_SAMPLE_BUFLEN];
+static uint8_t tx_sample_buf[TX_SAMPLE_BUFLEN];
 uint8_t AFSK_dac_isr(Afsk *afsk);
 
-// static uint8_t last_sample;
-bool flip = false;
+// Genera un bloque de muestras del modem y lo escribe al DAC continuo.
+// La función bloquea hasta que hay espacio DMA disponible.
 void transmit_audio_i2s(Afsk *afsk) {
-    // printf("transmit_audio_i2s\n");
-    gpio_set_level(GPIO_PTT_OUT, 0);
-    int i=0;
-    for (i=0; afsk->sending && i < TX_SAMPLE_BUFLEN; i++) {
-        uint8_t sample = AFSK_dac_isr(afsk);
-        // if (sample - last_sample > 20 || last_sample - sample < -20) {
-        //     printf("current sample significantly different than last sample: %d %d\n", sample, last_sample);
-        // }
-        // last_sample = sample;
-        tx_sample_buf[i] = (sample << 7) + (1<<15);
-        // tx_sample_buf[i] = flip ? 255<<8 : 0;
-        // for (int j=0; j<OVERSAMPLING; j++) {
-        //     tx_sample_buf[i + j] = sample << 8;
-        // }
-        if (afsk->sampleIndex == 0) {
-            flip = !flip;
-        }
+    if (!tx_mode) {
+        switch_to_tx();
     }
+    if (!dac_enabled) {
+        ESP_ERROR_CHECK(dac_continuous_enable(dac_handle));
+        dac_enabled = true;
+    }
+    gpio_set_level(GPIO_PTT_OUT, 1);  // PTT pulsado: activo alto → 1 = TX
+
+    int i = 0;
+    for (i = 0; afsk->sending && i < TX_SAMPLE_BUFLEN; i++) {
+        tx_sample_buf[i] = AFSK_dac_isr(afsk);
+    }
+    if (i == 0) return;
+
     size_t bytes_written = 0;
-    ESP_ERROR_CHECK(i2s_write(
-        I2S_NUM_0,
-        (void*) tx_sample_buf,
-        i * sizeof(uint16_t),
-        &bytes_written,
-        portMAX_DELAY
-    ));
-    // ESP_LOGI("transmit_audio_i2s", "Transmitted %d of %d samples with AFSK", bytes_written / 2, i);
+    ESP_ERROR_CHECK(dac_continuous_write(
+        dac_handle, tx_sample_buf, i, &bytes_written, -1));
 }
 
 void afsk_putchar(char c) {
@@ -184,40 +220,36 @@ int afsk_getchar(void) {
 
 void AFSK_transmit(char *buffer, size_t size) {
     fifo_flush(&AFSK_modem->txFifo);
-    for (int i=0; i<size; i++) {
+    for (size_t i = 0; i < size; i++) {
         if (fifo_isfull_locked(&AFSK_modem->txFifo)) {
             transmit_audio_i2s(AFSK_modem);
         }
-        afsk_putchar(buffer[i++]);
+        afsk_putchar(buffer[i]);
     }
-    // transmit_audio_i2s(AFSK_modem);
     finish_transmission();
 }
 
 void finish_transmission() {
-    printf("finish_transmission\n");
-    while(AFSK_modem->sending) {
-        // printf("calling transmit_audio_i2s\n");
+    ESP_LOGI("AFSK", "finish_transmission");
+    while (AFSK_modem->sending) {
         transmit_audio_i2s(AFSK_modem);
     }
 
-    uint16_t silence[256];
-    for (int i=0; i<256; i++) {
-        silence[i] = 3 << 14;
-    }
+    // Cola de silencio (valor medio 128 = 0 V tras el acople capacitivo)
+    // para permitir que el demodulador externo cierre la trama con limpieza.
+    uint8_t silence[256];
+    memset(silence, 128, sizeof(silence));
     size_t bytes_written = 0;
-    for (int i=0; i<20; i++) {
-        ESP_ERROR_CHECK(i2s_write(
-            I2S_NUM_0,
-            (void*) silence,
-            256 * sizeof(uint16_t),
-            &bytes_written,
-            portMAX_DELAY
-        ));
+    for (int i = 0; i < 20; i++) {
+        ESP_ERROR_CHECK(dac_continuous_write(
+            dac_handle, silence, sizeof(silence), &bytes_written, -1));
     }
-    printf("custom_preamble: %ld, custom_tail: %ld\n", custom_preamble, custom_tail);
-    gpio_set_level(GPIO_PTT_OUT, 1);
-    // ESP_ERROR_CHECK(i2s_zero_dma_buffer(I2S_NUM_0));
+
+    gpio_set_level(GPIO_PTT_OUT, 0);  // PTT liberado: activo alto → 0 = sin TX
+
+    // Libera I2S0 del DAC y reactiva el ADC para volver al modo recepción.
+    switch_to_rx();
+    ESP_LOGI("AFSK", "custom_preamble=%lu custom_tail=%lu", custom_preamble, custom_tail);
 }
 
 uint8_t AFSK_dac_isr(Afsk *afsk) {
@@ -306,9 +338,7 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
             // on the RX LED.
             fifo_push(fifo, HDLC_FLAG);
             hdlc->receiving = true;
-            if(!LibAPRS_open_squelch) {
-                LED_RX_ON();
-            }
+            LED_RX_ON();
         } else {
             // If the buffer is full, we have a problem
             // and abort by setting the return value to
@@ -428,6 +458,17 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
 
 
 void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
+        // Aquí se usa un autocorrelador para detectar los tonos
+    // usando un retraso de 446 uS
+    // 1 segundo son 9600 muestras
+    // 1000000/9600 = 104.16666666666667 uS por muestra
+    // deberemos aplicar un retraso de 446/104.16666666666667 = 4.28 muestras
+    // El retraso se fija en la configuración de la estructura afsk
+
+    // samples per bit = 9600/1200 = 8 -> 8/2 = 4 pero no sé porque lo justifica así
+
+    // >>1 divide por 2, >>2 divide por 4
+
     // To determine the received frequency, and thereby
     // the bit of the sample, we multiply the sample by
     // a sample delayed by (samples per bit / 2).
@@ -508,7 +549,7 @@ void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
         afsk->actualBits <<= 1;
 
         // We determine the actual bit value by reading
-        // the last 3 sampled bits. If there is three or
+        // the last 3 sampled bits. If there is two or
         // more 1's, we will assume that the transmitter
         // sent us a one, otherwise we assume a zero
         uint8_t bits = afsk->sampledBits & 0x07;
@@ -581,122 +622,74 @@ extern void APRS_poll(void);
 //     }
 // }
 
+// Offset DC estimado con EMA (constante de tiempo ~1024 muestras a 48 kHz ≈ 21 ms).
+// Valor inicial: punto medio del ADC de 12 bits = 2048.
+// Se mantiene en Q10.10 fixed-point para suavizar sin perder precisión.
+static int32_t dc_offset_q10 = 2048 << 10;
 
-void record_audio(uint16_t *buffer) {
-    size_t bytes_read;
-    esp_err_t error = i2s_read(TNC_I2S_NUM, (void*) buffer, TNC_I2S_BUFLEN * sizeof(uint16_t), &bytes_read, portMAX_DELAY /*(3 * TNC_I2S_SAMPLE_RATE / TNC_I2S_BUFLEN / 2 / portTICK_PERIOD_MS) */);
-
-    for (int i=0; i<TNC_I2S_BUFLEN; i++) {
-        buffer[i] = 4095 - buffer[i];
-    }
-
-    // printf("error %d, read %d bytes\n", error, bytes_read);
+// Convierte una muestra cruda del ADC (0..4095) a int8_t centrado y escalado,
+// aplicando eliminación DC incremental.
+static inline int8_t adc_to_s8(uint16_t raw12) {
+    dc_offset_q10 += (raw12 - (dc_offset_q10 >> 10));
+    int32_t centered = (int32_t)raw12 - (dc_offset_q10 >> 10);  // ~ -2048..2047
+    int32_t s = centered >> 4;                                   // ~ -128..127
+    if (s < -128) s = -128;
+    else if (s > 127) s = 127;
+    return (int8_t)s;
 }
 
-void process_audio(uint16_t *buffer) {
-    // printf("processing buffer %d\n", (int)buffer);
-    for (int i=0; i<TNC_I2S_BUFLEN; i += OVERSAMPLING) {
-        int average = 0;
-        for (int j=0; j<OVERSAMPLING && j+i < TNC_I2S_BUFLEN; j++) {
-            average += buffer[i+j];
-        }
-        average /= OVERSAMPLING;
-
-        average -= 717; // empirically measured hackily, we high-pass-filter later so this doesn't matter much.
-        average = average * 255 / 1564;
-        if (average < -128) average = -128;
-        if (average > 127) average = 127;
-
-        if (audio_buf_full_idx < FULL_BUF_LEN) {
-            audio_buf_full[audio_buf_full_idx++] = average;
-        }
-    }
-}
-
-
+// Tarea de recepción en modo streaming continuo: cada muestra decimada pasa
+// inmediatamente por el demodulador AFSK, sin acumulaciones ni pausas.
+// Esto es lo que requiere el sincronizador HDLC para detectar flags 0x7E
+// y mantener la fase a lo largo de toda la trama.
 void receive_audio_task(void *arg) {
-    gpio_num_t io_num;
-    for(;;) {
-        if(xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
-            gpio_isr_handler_remove(GPIO_AUDIO_TRIGGER);
-            uint32_t bogus;
-            while (xQueueReceive(gpio_evt_queue, &bogus, 0)); // clear queue
+    uint8_t poll_timer = 0;
+    int ov_count = 0;
+    int32_t ov_sum = 0;
+    static uint8_t read_buf[ADC_READ_BUF_BYTES];
 
-            // grab audio lock
-            // until tail N bytes of buffer are < threshold:
-            //   record audio into buffer
-            //   swap to other buffer
-            //   send audio buffer to queue for processing
-            ESP_LOG_LEVEL(ESP_LOG_INFO, "receive_audio_task", "GPIO[%d] intr, val: %d\n", io_num, gpio_get_level(io_num));
+    for (;;) {
+        if (tx_mode) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
 
-            uint16_t *buffer = audio_buf1;
+        uint32_t bytes_read = 0;
+        esp_err_t err = adc_continuous_read(adc_handle, read_buf, sizeof(read_buf),
+                                            &bytes_read, pdMS_TO_TICKS(20));
+        if (err != ESP_OK || bytes_read == 0) {
+            continue;
+        }
 
-            int num_recordings = 0;
+        for (uint32_t i = 0; i < bytes_read; i += SOC_ADC_DIGI_RESULT_BYTES) {
+            adc_digi_output_data_t *d = (adc_digi_output_data_t *)&read_buf[i];
+            // Filtrar por canal: en modo TYPE1 (ESP32) d->type1.channel indica el canal.
+            if (d->type1.channel != AUDIO_ADC_CHANNEL) continue;
 
-            i2s_adc_enable(TNC_I2S_NUM);
+            // Acumular para decimar x OVERSAMPLING (48 kHz → 9600 Hz lógicos).
+            ov_sum += d->type1.data;
+            if (++ov_count >= OVERSAMPLING) {
+                uint16_t avg12 = (uint16_t)(ov_sum / OVERSAMPLING);
+                ov_sum = 0;
+                ov_count = 0;
 
-            for (bool keep_recording = true; keep_recording; ) {
-                num_recordings++;
-                record_audio(buffer);
-                process_audio(buffer);
-
-                // printf("still recording\n");
-                keep_recording = false;
-                for (int i=0; i<TNC_I2S_BUFLEN; i++) {
-                    if (buffer[i] > KEEP_RECORDING_THRESH) {
-                        keep_recording = true;
-                        break;
-                    }
-                }
-
-                //switch to other buffer.
-                if (buffer == audio_buf1) {
-                    buffer = audio_buf2;
-                    // printf("switched to audio_buf2\n");
-                } else {
-                    buffer = audio_buf1;
-                    // printf("switched to audio_buf1\n");
-                }
-            }
-
-            i2s_adc_disable(TNC_I2S_NUM);
-
-            int running_sum = 0;
-            uint8_t running_sum_len = 0;
-            #define MAX_RUNNING_SUM_LEN (DESIRED_SAMPLE_RATE / 600)
-            ESP_LOG_LEVEL(ESP_LOG_INFO, "receive_audio_task", "did %d recordings in %d ticks\n", num_recordings, 0);
-            uint8_t poll_timer = 0;
-
-            // viterbi(1.0);
-
-            for (int i=0; i<audio_buf_full_idx; i++) {
-                int16_t sample = audio_buf_full[i];
-                running_sum += sample;
-                if (running_sum_len >= MAX_RUNNING_SUM_LEN) {
-                    running_sum -= audio_buf_full[i - (running_sum_len)];
-                } else {
-                    running_sum_len++;
-                }
-
-                sample -= running_sum / running_sum_len;
-                if (sample > 127) sample = 127;
-                if (sample < -128) sample = 128;
-
-                // printf("%d ", sample);
-                // if (i%20 == 19) printf("\n");
-
+                int8_t sample = adc_to_s8(avg12);
+                int8_t a = sample < 0 ? -sample : sample;
+                if (a > audio_peak) audio_peak = a;
                 AFSK_adc_isr(AFSK_modem, sample);
-                poll_timer++;
-                if (poll_timer > 3) {
+
+                // APRS_poll procesa el FIFO rxFifo y dispara el callback si llega trama.
+                // Se llama cada 4 muestras (~2,4 ms a 9600 Hz) para no saturar el loop.
+                if (++poll_timer > 3) {
                     poll_timer = 0;
                     APRS_poll();
                 }
             }
-
-            audio_buf_full_idx = 0;
-
-            gpio_isr_handler_add(GPIO_AUDIO_TRIGGER, gpio_isr_handler, (void*) GPIO_AUDIO_TRIGGER);
         }
+        // Cede el CPU al menos 1 tick tras procesar cada trama. Sin esto, la tarea
+        // corre en bucle cerrado (el ring buffer del ADC siempre tiene datos) y
+        // IDLE0 nunca puede ejecutar su reset del watchdog.
+        vTaskDelay(1);
     }
 }
 

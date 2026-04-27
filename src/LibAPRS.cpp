@@ -5,7 +5,6 @@
 
 // Afsk modem;
 AX25Ctx AX25;
-extern "C" void aprs_msg_callback(struct AX25Msg *msg);
 #define countof(a) sizeof(a)/sizeof(a[0])
 
 int LibAPRS_vref = REF_3V3;
@@ -58,11 +57,23 @@ void APRS_init(int reference, bool open_squelch) {
 
     Afsk *modem = (Afsk *)malloc(sizeof(Afsk));
     AFSK_init(modem);
-    ax25_init(&AX25, aprs_msg_callback);
+    ax25_init(&AX25, NULL);  // registrar hook con APRS_set_msg_hook o APRS_set_raw_hook
 }
 
 void APRS_poll(void) {
     ax25_poll(&AX25);
+}
+
+void APRS_set_msg_hook(ax25_callback_t hook) {
+    AX25.hook = hook;
+}
+
+void APRS_set_raw_hook(ax25_raw_callback_t hook) {
+    AX25.raw_hook = hook;
+}
+
+void APRS_send_raw_frame(const uint8_t *buf, size_t len) {
+    ax25_sendRaw(&AX25, (void *)buf, len);
 }
 
 void APRS_setCallsign(char *call, int ssid) {
@@ -315,36 +326,8 @@ void APRS_msgRetry() {
     APRS_sendMsg(lastMessage, lastMessageLen);
 }
 
-// For getting free memory, from:
-// http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1213583720/15
-
-extern unsigned int __heap_start;
-extern void *__brkval;
-
-struct __freelist {
-  size_t sz;
-  struct __freelist *nx;
-};
-
-extern struct __freelist *__flp;
-
-int freeListSize() {
-  struct __freelist* current;
-  int total = 0;
-  for (current = __flp; current; current = current->nx) {
-    total += 2; /* Add two bytes for the memory block's header  */
-    total += (int) current->sz;
-  }
-  return total;
-}
 
 int freeMemory() {
-  int free_memory;
-  if ((int)__brkval == 0) {
-    free_memory = ((int)&free_memory) - ((int)&__heap_start);
-  } else {
-    free_memory = ((int)&free_memory) - ((int)__brkval);
-    free_memory += freeListSize();
-  }
-  return free_memory;
+    // TODO quitar dependencia de esto
+    return 10000000;
 }

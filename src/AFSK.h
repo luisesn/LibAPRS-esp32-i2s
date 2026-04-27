@@ -53,7 +53,7 @@ inline static uint8_t sinSample(uint16_t i) {
 #define MARK_FREQ  1200
 #define SPACE_FREQ 2200
 #define PHASE_BITS   8                              // How much to increment phase counter each sample
-#define PHASE_INC    3                              // Nudge by an eigth of a sample each adjustment
+#define PHASE_INC    1                              // Nudge by an eigth of a sample each adjustment
 #define PHASE_MAX    (SAMPLESPERBIT * PHASE_BITS)   // Resolution of our phase counter = 64
 #define PHASE_THRESHOLD  (PHASE_MAX / 2)            // Target transition point of our phase window
 
@@ -127,9 +127,9 @@ typedef struct Afsk
 #define LED_TX_ON()   do { /*LED_PORT |= _BV(1);*/ } while (0)
 #define LED_TX_OFF()  do { /*LED_PORT &= ~_BV(1);*/ } while (0)
 
-#define LED_RX_INIT() do { /*LED_DDR |= _BV(2);*/ } while (0)
-#define LED_RX_ON()   do { /*LED_PORT |= _BV(2);*/ } while (0)
-#define LED_RX_OFF()  do { /*LED_PORT &= ~_BV(2);*/ } while (0)
+#define LED_RX_INIT() do {  } while (0)
+#define LED_RX_ON()   do {  } while (0)
+#define LED_RX_OFF()  do {  } while (0)
 
 #ifdef __cplusplus
 extern "C"
@@ -148,6 +148,7 @@ int afsk_getchar(void);
 
 
 extern Afsk *AFSK_modem;
+extern volatile int8_t audio_peak;
 
 #ifdef __cplusplus
 } // extern "C"
