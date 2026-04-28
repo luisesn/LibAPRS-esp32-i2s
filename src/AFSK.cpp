@@ -207,7 +207,11 @@ static void AFSK_txStart(Afsk *afsk) {
     // printf("AFSK_txStart\n");
 }
 
-#define TX_SAMPLE_BUFLEN (8 * CONFIG_AFSK_DAC_SAMPLERATE / BITRATE)
+// Un descriptor DAC = buf_size bytes = 2048/48000 s ≈ 42 ms de audio.
+// Con 8 descriptores el DMA tiene ~336 ms de margen frente a preempciones WiFi
+// (prio 23 > prio 10 de receive_audio_task). Si TX_SAMPLE_BUFLEN < buf_size el
+// descriptor dura menos y el DMA puede quedarse sin datos entre escrituras.
+#define TX_SAMPLE_BUFLEN 2048
 static uint8_t tx_sample_buf[TX_SAMPLE_BUFLEN];
 uint8_t AFSK_dac_isr(Afsk *afsk);
 
