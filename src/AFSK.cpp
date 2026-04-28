@@ -97,6 +97,12 @@ static void adc_peripheral_start(void) {
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 }
 
+// Un descriptor DAC = buf_size bytes = 2048/48000 s ≈ 42 ms de audio.
+// Con 8 descriptores el DMA tiene ~336 ms de margen frente a preempciones WiFi
+// (prio 23 > prio 10 de receive_audio_task). Si TX_SAMPLE_BUFLEN < buf_size el
+// descriptor dura menos y el DMA puede quedarse sin datos entre escrituras.
+#define TX_SAMPLE_BUFLEN 2048
+
 // Cede I2S0 del ADC al DAC para poder transmitir.
 // Llamado siempre desde receive_audio_task (la misma tarea que inició el ADC),
 // por lo que adc_continuous_stop respeta el mutex interno de ESP-IDF.
@@ -123,12 +129,14 @@ static void switch_to_tx(void) {
     ESP_ERROR_CHECK(dac_continuous_enable(dac_handle));
     dac_enabled = true;
 
-    // Escribir silencio inicial para que los descriptores DMA tengan datos y
-    // el oscilador I2S arranque correctamente antes de enviar audio real.
-    uint8_t silence[256];
-    memset(silence, 128, sizeof(silence));
-    size_t bw = 0;
-    dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 200);
+    // Cebar el DMA con un descriptor completo de silencio para que el oscilador
+    // I2S arranque antes de la primera escritura de audio real.
+    {
+        uint8_t silence[TX_SAMPLE_BUFLEN];
+        memset(silence, 128, sizeof(silence));
+        size_t bw = 0;
+        dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 500);
+    }
 
     // SIMUL mode configura I2S en estéreo (L→DAC2=GPIO26, R→DAC1=GPIO25).
     // Reafirmar GPIO26 como salida digital para que PTT siga siendo controlable.
@@ -207,15 +215,13 @@ static void AFSK_txStart(Afsk *afsk) {
     // printf("AFSK_txStart\n");
 }
 
-// Un descriptor DAC = buf_size bytes = 2048/48000 s ≈ 42 ms de audio.
-// Con 8 descriptores el DMA tiene ~336 ms de margen frente a preempciones WiFi
-// (prio 23 > prio 10 de receive_audio_task). Si TX_SAMPLE_BUFLEN < buf_size el
-// descriptor dura menos y el DMA puede quedarse sin datos entre escrituras.
-#define TX_SAMPLE_BUFLEN 2048
 static uint8_t tx_sample_buf[TX_SAMPLE_BUFLEN];
 uint8_t AFSK_dac_isr(Afsk *afsk);
 
 // Genera un bloque de muestras del modem y lo escribe al DAC continuo.
+// Siempre escribe TX_SAMPLE_BUFLEN bytes: rellena con silencio si la
+// transmisión termina antes de llenar el buffer. Esto mantiene el DMA vivo
+// durante el tiempo necesario para que finish_transmission escriba silencio.
 void transmit_audio_i2s(Afsk *afsk) {
     if (!tx_mode) {
         switch_to_tx();
@@ -227,16 +233,19 @@ void transmit_audio_i2s(Afsk *afsk) {
     for (i = 0; afsk->sending && i < TX_SAMPLE_BUFLEN; i++) {
         tx_sample_buf[i] = AFSK_dac_isr(afsk);
     }
-    if (i == 0) return;
+    // Rellenar el resto del descriptor con silencio para que el DMA no se
+    // quede sin datos entre esta escritura y las de silencio de finish_transmission.
+    if (i < TX_SAMPLE_BUFLEN) {
+        memset(tx_sample_buf + i, 128, TX_SAMPLE_BUFLEN - i);
+    }
 
     size_t bytes_written = 0;
-    // Timeout de 2 s: si el DMA no consume en ese tiempo algo falló en el driver.
     esp_err_t err = dac_continuous_write(
-        dac_handle, tx_sample_buf, i, &bytes_written, 2000);
+        dac_handle, tx_sample_buf, TX_SAMPLE_BUFLEN, &bytes_written, 2000);
     if (err != ESP_OK || bytes_written == 0) {
         ESP_LOGE("AFSK", "dac_continuous_write error %s (written=%u/%d)",
-                 esp_err_to_name(err), (unsigned)bytes_written, i);
-        afsk->sending = false;  // abortar TX antes de colgar indefinidamente
+                 esp_err_to_name(err), (unsigned)bytes_written, TX_SAMPLE_BUFLEN);
+        afsk->sending = false;
     }
 }
 
@@ -274,13 +283,14 @@ void finish_transmission() {
         transmit_audio_i2s(AFSK_modem);
     }
 
-    // Cola de silencio (valor medio 128 = 0 V tras el acople capacitivo)
-    // para permitir que el demodulador externo cierre la trama con limpieza.
-    uint8_t silence[256];
-    memset(silence, 128, sizeof(silence));
-    for (int i = 0; i < 20; i++) {
+    // Silencio de cola: un descriptor completo (≈42 ms) es suficiente para que
+    // el demodulador externo cierre la trama. El DMA ya tiene TX_SAMPLE_BUFLEN
+    // bytes de silencio del último bloque generado; este write añade uno más.
+    {
+        uint8_t silence[TX_SAMPLE_BUFLEN];
+        memset(silence, 128, sizeof(silence));
         size_t bw = 0;
-        dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 500);
+        dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 2000);
     }
 
     gpio_set_level(GPIO_PTT_OUT, 0);  // PTT liberado: activo alto → 0 = sin TX
