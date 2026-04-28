@@ -1,9 +1,11 @@
 #include <string.h>
 #include "AFSK.h"
+#include "AX25.h"
 #include "LibAPRS.h"
 #include "FakeArduino.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/dac_continuous.h"
 #include "esp_adc/adc_continuous.h"
 #include "driver/gpio.h"
@@ -26,6 +28,23 @@ bool hw_afsk_dac_isr = false;
 static dac_continuous_handle_t dac_handle;
 static adc_continuous_handle_t adc_handle;
 static bool dac_enabled = false;
+
+// Cola de tramas TX pendientes: server_task encola, receive_audio_task despacha.
+// Así el mutex del ADC siempre lo adquiere y libera la misma tarea.
+typedef struct { uint8_t data[AX25_MAX_FRAME_LEN]; size_t len; } afsk_tx_frame_t;
+static QueueHandle_t             s_tx_queue = NULL;
+static void (*s_tx_fn)(const uint8_t *, size_t) = NULL;
+
+void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t)) { s_tx_fn = fn; }
+
+void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
+    if (!s_tx_queue || !data || len == 0) return;
+    afsk_tx_frame_t f;
+    if (len > AX25_MAX_FRAME_LEN) len = AX25_MAX_FRAME_LEN;
+    memcpy(f.data, data, len);
+    f.len = len;
+    xQueueSendToBack(s_tx_queue, &f, 0);  // no bloqueante: descarta si llena
+}
 // true while DAC is active (TX); receive_audio_task pauses during this time.
 static volatile bool tx_mode = false;
 
@@ -79,18 +98,21 @@ static void adc_peripheral_start(void) {
 }
 
 // Cede I2S0 del ADC al DAC para poder transmitir.
+// Llamado siempre desde receive_audio_task (la misma tarea que inició el ADC),
+// por lo que adc_continuous_stop respeta el mutex interno de ESP-IDF.
 static void switch_to_tx(void) {
     tx_mode = true;
-    // adc_continuous_stop desbloquea cualquier adc_continuous_read pendiente.
-    adc_continuous_stop(adc_handle);
-    // Esperamos a que receive_audio_task salga del read y vea tx_mode=true.
-    vTaskDelay(pdMS_TO_TICKS(30));
+    ESP_LOGI("AFSK", "switch_to_tx: stopping ADC");
+    ESP_ERROR_CHECK(adc_continuous_stop(adc_handle));
     ESP_ERROR_CHECK(adc_continuous_deinit(adc_handle));
     adc_handle = NULL;
 
+    // Pequeña pausa para que I2S0 se libere completamente antes de que el DAC lo tome.
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     dac_continuous_config_t dac_cfg = {
         .chan_mask = DAC_CHANNEL_MASK_CH0,
-        .desc_num  = 4,
+        .desc_num  = 8,
         .buf_size  = 2048,
         .freq_hz   = CONFIG_AFSK_DAC_SAMPLERATE,
         .offset    = 0,
@@ -98,10 +120,20 @@ static void switch_to_tx(void) {
         .chan_mode  = DAC_CHANNEL_MODE_SIMUL,
     };
     ESP_ERROR_CHECK(dac_continuous_new_channels(&dac_cfg, &dac_handle));
+    ESP_ERROR_CHECK(dac_continuous_enable(dac_handle));
+    dac_enabled = true;
+
+    // Escribir silencio inicial para que los descriptores DMA tengan datos y
+    // el oscilador I2S arranque correctamente antes de enviar audio real.
+    uint8_t silence[256];
+    memset(silence, 128, sizeof(silence));
+    size_t bw = 0;
+    dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 200);
 
     // SIMUL mode configura I2S en estéreo (L→DAC2=GPIO26, R→DAC1=GPIO25).
     // Reafirmar GPIO26 como salida digital para que PTT siga siendo controlable.
     gpio_set_direction(GPIO_PTT_OUT, GPIO_MODE_OUTPUT);
+    ESP_LOGI("AFSK", "switch_to_tx: DAC ready");
 }
 
 // Devuelve I2S0 al ADC tras finalizar la transmisión.
@@ -115,6 +147,7 @@ static void switch_to_rx(void) {
 
     adc_peripheral_start();
     tx_mode = false;
+    printf("Switched back to RX mode.\n");
 }
 
 void AFSK_hw_init(void) {
@@ -129,12 +162,12 @@ void AFSK_hw_init(void) {
     ESP_ERROR_CHECK(gpio_config(&ptt_cfg));
     gpio_set_level(GPIO_PTT_OUT, 0);  // reposo: activo alto → 0 = sin TX
 
-    // Arrancamos solo el ADC continuo (I2S0 en modo ADC DMA).
-    // El DAC se inicializa bajo demanda en switch_to_tx().
-    adc_peripheral_start();
+    // La cola de TX se crea aquí; receive_audio_task arranca el ADC y despacha TX.
+    s_tx_queue = xQueueCreate(4, sizeof(afsk_tx_frame_t));
 
     // Tarea de recepción en streaming continuo.
-    xTaskCreate(receive_audio_task, "receive_audio_task", 4096, NULL, 10, NULL);
+    // Stack 8192: la tarea también despacha TX (ax25_sendRaw + finish_transmission).
+    xTaskCreate(receive_audio_task, "receive_audio_task", 8192, NULL, 10, NULL);
 }
 
 void AFSK_init(Afsk *afsk) {
@@ -171,7 +204,7 @@ static void AFSK_txStart(Afsk *afsk) {
       afsk->tailLength = DIV_ROUND(custom_tail * BITRATE, 8000);
     }
 
-    printf("AFSK_txStart\n");
+    // printf("AFSK_txStart\n");
 }
 
 #define TX_SAMPLE_BUFLEN (8 * CONFIG_AFSK_DAC_SAMPLERATE / BITRATE)
@@ -179,15 +212,11 @@ static uint8_t tx_sample_buf[TX_SAMPLE_BUFLEN];
 uint8_t AFSK_dac_isr(Afsk *afsk);
 
 // Genera un bloque de muestras del modem y lo escribe al DAC continuo.
-// La función bloquea hasta que hay espacio DMA disponible.
 void transmit_audio_i2s(Afsk *afsk) {
     if (!tx_mode) {
         switch_to_tx();
     }
-    if (!dac_enabled) {
-        ESP_ERROR_CHECK(dac_continuous_enable(dac_handle));
-        dac_enabled = true;
-    }
+    // DAC ya habilitado en switch_to_tx(); no re-habilitar aquí.
     gpio_set_level(GPIO_PTT_OUT, 1);  // PTT pulsado: activo alto → 1 = TX
 
     int i = 0;
@@ -197,8 +226,14 @@ void transmit_audio_i2s(Afsk *afsk) {
     if (i == 0) return;
 
     size_t bytes_written = 0;
-    ESP_ERROR_CHECK(dac_continuous_write(
-        dac_handle, tx_sample_buf, i, &bytes_written, -1));
+    // Timeout de 2 s: si el DMA no consume en ese tiempo algo falló en el driver.
+    esp_err_t err = dac_continuous_write(
+        dac_handle, tx_sample_buf, i, &bytes_written, 2000);
+    if (err != ESP_OK || bytes_written == 0) {
+        ESP_LOGE("AFSK", "dac_continuous_write error %s (written=%u/%d)",
+                 esp_err_to_name(err), (unsigned)bytes_written, i);
+        afsk->sending = false;  // abortar TX antes de colgar indefinidamente
+    }
 }
 
 void afsk_putchar(char c) {
@@ -239,10 +274,9 @@ void finish_transmission() {
     // para permitir que el demodulador externo cierre la trama con limpieza.
     uint8_t silence[256];
     memset(silence, 128, sizeof(silence));
-    size_t bytes_written = 0;
     for (int i = 0; i < 20; i++) {
-        ESP_ERROR_CHECK(dac_continuous_write(
-            dac_handle, silence, sizeof(silence), &bytes_written, -1));
+        size_t bw = 0;
+        dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 500);
     }
 
     gpio_set_level(GPIO_PTT_OUT, 0);  // PTT liberado: activo alto → 0 = sin TX
@@ -648,7 +682,20 @@ void receive_audio_task(void *arg) {
     int32_t ov_sum = 0;
     static uint8_t read_buf[ADC_READ_BUF_BYTES];
 
+    // El ADC se arranca desde esta tarea para que el mutex interno de ESP-IDF
+    // quede asociado a ella. switch_to_tx/rx lo para/arranca siempre desde aquí.
+    adc_peripheral_start();
+
     for (;;) {
+        // Despachar trama TX pendiente (encolada por server_task vía afsk_queue_tx_frame).
+        // Al ejecutar desde esta tarea, adc_continuous_stop/start respetan el mutex.
+        if (!tx_mode && s_tx_queue && s_tx_fn) {
+            afsk_tx_frame_t f;
+            if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE) {
+                s_tx_fn(f.data, f.len);
+            }
+        }
+
         if (tx_mode) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;

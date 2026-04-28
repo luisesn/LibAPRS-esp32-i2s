@@ -30,7 +30,7 @@
 
 #define GPIO_AUDIO_TRIGGER GPIO_NUM_37
 // Audio input pin is controlled by I2S_ADC_CHANNEL below.
-// Audio output pin is ...hardcoded as GPIO 25?
+// Audio output pin is hardcoded on hardware as GPIO 25
 #define GPIO_PTT_OUT GPIO_NUM_26
 #define ESP_INTR_FLAG_DEFAULT 0
 

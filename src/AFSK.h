@@ -146,6 +146,9 @@ void finish_transmission();
 void afsk_putchar(char c);
 int afsk_getchar(void);
 
+// TX dispatch desde receive_audio_task (evita cruce de mutex ADC entre tareas)
+void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t));
+void afsk_queue_tx_frame(const uint8_t *data, size_t len);
 
 extern Afsk *AFSK_modem;
 extern volatile int8_t audio_peak;

@@ -74,6 +74,7 @@ void APRS_set_raw_hook(ax25_raw_callback_t hook) {
 
 void APRS_send_raw_frame(const uint8_t *buf, size_t len) {
     ax25_sendRaw(&AX25, (void *)buf, len);
+    finish_transmission();
 }
 
 void APRS_setCallsign(char *call, int ssid) {
