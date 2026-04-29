@@ -326,9 +326,3 @@ void APRS_msgRetry() {
     message_seq--;
     APRS_sendMsg(lastMessage, lastMessageLen);
 }
-
-
-int freeMemory() {
-    // TODO quitar dependencia de esto
-    return 10000000;
-}

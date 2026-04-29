@@ -8,6 +8,7 @@
 // #include <avr/pgmspace.h>
 #include "FIFO.h"
 #include "HDLC.h"
+#include "driver/gpio.h"   // required by the LED_TX/RX macros below
 
 #define TRUE_SIN_LEN 512
 #define SIN_LEN (TRUE_SIN_LEN * OVERSAMPLING)
@@ -121,23 +122,25 @@ typedef struct Afsk
 
 #define AFSK_DAC_IRQ_START()   do { extern bool hw_afsk_dac_isr; hw_afsk_dac_isr = true; } while (0)
 #define AFSK_DAC_IRQ_STOP()    do { extern bool hw_afsk_dac_isr; hw_afsk_dac_isr = false; } while (0)
-// AVR legacy: configured Port D bits [7:3] as DAC output pins. Not applicable
-// on ESP32; the DAC is managed entirely by the dac_continuous driver.
-// This macro is defined for compatibility but is never called.
-#define AFSK_DAC_INIT()        do { DAC_DDR |= 0xF8; } while (0)
+// AVR legacy: configured Port D bits [7:3] as DAC output pins. On ESP32 the
+// DAC is managed entirely by the dac_continuous driver. This macro is defined
+// for compatibility but is never called.
+#define AFSK_DAC_INIT()        do { /* no-op on ESP32 */ } while (0)
 
-// Here's some macros for controlling the RX/TX LEDs
-// THE _INIT() functions writes to the DDRB register
-// to configure the pins as output pins, and the _ON()
-// and _OFF() functions writes to the PORT registers
-// to turn the pins on or off.
-#define LED_TX_INIT() do { /*LED_DDR |= _BV(1);*/ } while (0)
-#define LED_TX_ON()   do { /*LED_PORT |= _BV(1);*/ } while (0)
-#define LED_TX_OFF()  do { /*LED_PORT &= ~_BV(1);*/ } while (0)
+// Optional TX/RX LED indicators driven by configurable GPIO pins.
+// Call AFSK_set_leds() after APRS_init() to enable; pass -1 to disable either.
+// Defaults: both disabled (-1), preserving previous no-op behaviour.
+extern int s_led_tx_gpio;
+extern int s_led_rx_gpio;
 
-#define LED_RX_INIT() do {  } while (0)
-#define LED_RX_ON()   do {  } while (0)
-#define LED_RX_OFF()  do {  } while (0)
+// LED_INIT macros are no-ops: GPIO configuration is done in AFSK_set_leds().
+#define LED_TX_INIT() do { } while (0)
+#define LED_TX_ON()   do { if (s_led_tx_gpio >= 0) gpio_set_level((gpio_num_t)s_led_tx_gpio, 1); } while (0)
+#define LED_TX_OFF()  do { if (s_led_tx_gpio >= 0) gpio_set_level((gpio_num_t)s_led_tx_gpio, 0); } while (0)
+
+#define LED_RX_INIT() do { } while (0)
+#define LED_RX_ON()   do { if (s_led_rx_gpio >= 0) gpio_set_level((gpio_num_t)s_led_rx_gpio, 1); } while (0)
+#define LED_RX_OFF()  do { if (s_led_rx_gpio >= 0) gpio_set_level((gpio_num_t)s_led_rx_gpio, 0); } while (0)
 
 #ifdef __cplusplus
 extern "C"
@@ -160,8 +163,13 @@ int afsk_getchar(void);
 void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t));
 void afsk_queue_tx_frame(const uint8_t *data, size_t len);
 
-// Hook de audio RX: llamado con cada muestra decimada (int8_t, 9600 Hz).
-// Permite enganchar tareas externas (p.ej. streaming) de forma no bloqueante.
+// Configure optional TX and RX LED indicator GPIOs.
+// Pass a valid GPIO number (>= 0) to enable; pass -1 to disable.
+// Must be called after APRS_init(). Defaults to -1 (both LEDs disabled).
+void AFSK_set_leds(int gpio_tx, int gpio_rx);
+
+// RX audio hook: called with each decimated logical sample (int8_t, 9600 Hz).
+// Allows attaching external tasks (e.g. audio streaming) in a non-blocking way.
 void afsk_set_audio_hook(void (*fn)(int8_t));
 
 extern Afsk *AFSK_modem;

@@ -51,8 +51,6 @@ void APRS_msgRetry();
 
 void APRS_printSettings();
 
-int freeMemory();
-
 
 #ifdef __cplusplus
 }

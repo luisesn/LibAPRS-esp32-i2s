@@ -68,13 +68,35 @@ volatile int8_t audio_peak = 0;
 #define ADC_READ_BUF_BYTES    (ADC_FRAME_SIZE * SOC_ADC_DIGI_RESULT_BYTES)
 
 
-// Forward declerations
+// Forward declarations
 int afsk_getchar(void);
 void afsk_putchar(char c);
 void receive_audio_task(void *arg);
 
-void AFSK_hw_refDetect(void) {
-    // TODO quitar
+// Optional LED indicator GPIOs (-1 = disabled). Set via AFSK_set_leds().
+int s_led_tx_gpio = -1;
+int s_led_rx_gpio = -1;
+
+void AFSK_set_leds(int gpio_tx, int gpio_rx) {
+    s_led_tx_gpio = gpio_tx;
+    s_led_rx_gpio = gpio_rx;
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = 0,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_tx >= 0) {
+        led_cfg.pin_bit_mask = 1ULL << gpio_tx;
+        gpio_config(&led_cfg);
+        gpio_set_level((gpio_num_t)gpio_tx, 0);
+    }
+    if (gpio_rx >= 0) {
+        led_cfg.pin_bit_mask = 1ULL << gpio_rx;
+        gpio_config(&led_cfg);
+        gpio_set_level((gpio_num_t)gpio_rx, 0);
+    }
 }
 
 // On classic ESP32, dac_continuous and adc_continuous both use the I2S0
@@ -670,22 +692,6 @@ void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
 
 
 extern void APRS_poll(void);
-// uint8_t poll_timer = 0;
-// ISR(ADC_vect) {
-//     TIFR1 = _BV(ICF1);
-//     AFSK_adc_isr(AFSK_modem, ((int16_t)((ADC) >> 2) - 128));
-//     if (hw_afsk_dac_isr) {
-//         DAC_PORT = (AFSK_dac_isr(AFSK_modem) & 0xF0) | _BV(3);
-//     } else {
-//         DAC_PORT = 128;
-//     }
-
-//     poll_timer++;
-//     if (poll_timer > 3) {
-//         poll_timer = 0;
-//         APRS_poll();
-//     }
-// }
 
 // Estimated DC offset, tracked with an EMA (Exponential Moving Average) with a
 // time constant of ~1024 logical samples (at 9600 Hz ≈ 107 ms). The initial
