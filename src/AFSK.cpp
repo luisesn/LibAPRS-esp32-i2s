@@ -19,23 +19,32 @@ extern int LibAPRS_vref;
 
 Afsk *AFSK_modem;
 
-// Definición requerida por las macros AFSK_DAC_IRQ_START/STOP en AFSK.h.
-// En el puerto AVR original habilitaba el ISR de DAC; aquí solo indica
-// si el generador de muestras está activo (no se consulta actualmente,
-// pero la variable debe existir para que linkee).
+// Required by the AFSK_DAC_IRQ_START/STOP macros defined in AFSK.h.
+// On the original AVR port this flag enabled the DAC ISR in hardware.
+// On ESP32 it only tracks whether the sample generator is active; it is
+// not currently read by any code path but must exist for the linker.
 bool hw_afsk_dac_isr = false;
 
 static dac_continuous_handle_t dac_handle;
 static adc_continuous_handle_t adc_handle;
 static bool dac_enabled = false;
 
-// Cola de tramas TX pendientes: server_task encola, receive_audio_task despacha.
-// Así el mutex del ADC siempre lo adquiere y libera la misma tarea.
+// TX frame queue design rationale:
+// The ESP-IDF adc_continuous driver internally binds a mutex to the FreeRTOS
+// task that called adc_continuous_start(). Only that same task can later call
+// adc_continuous_stop() without deadlocking. server_task must therefore never
+// call APRS_send_raw_frame() directly (which internally calls adc_continuous_stop).
+// Instead it enqueues outgoing frames here via afsk_queue_tx_frame(); the
+// receive_audio_task dequeues and dispatches them at the top of each loop
+// iteration, keeping all ADC stop/start calls in the same task context.
 typedef struct { uint8_t data[AX25_MAX_FRAME_LEN]; size_t len; } afsk_tx_frame_t;
 static QueueHandle_t             s_tx_queue = NULL;
 static void (*s_tx_fn)(const uint8_t *, size_t) = NULL;
 
 void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t)) { s_tx_fn = fn; }
+
+static void (*s_audio_hook)(int8_t) = NULL;
+void afsk_set_audio_hook(void (*fn)(int8_t)) { s_audio_hook = fn; }
 
 void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
     if (!s_tx_queue || !data || len == 0) return;
@@ -43,17 +52,17 @@ void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
     if (len > AX25_MAX_FRAME_LEN) len = AX25_MAX_FRAME_LEN;
     memcpy(f.data, data, len);
     f.len = len;
-    xQueueSendToBack(s_tx_queue, &f, 0);  // no bloqueante: descarta si llena
+    xQueueSendToBack(s_tx_queue, &f, 0);  // non-blocking: drops frame if queue is full
 }
 // true while DAC is active (TX); receive_audio_task pauses during this time.
 static volatile bool tx_mode = false;
 
-// Pico absoluto de la última muestra decimada; lo lee y resetea audio_level_task.
+// Absolute peak of the last decimated sample; read and reset by audio_level_task.
 volatile int8_t audio_peak = 0;
 
-// Tamaño del chunk DMA leído por iteración. A 48 kHz, 1024 muestras = ~21 ms,
-// suficientemente pequeño para latencia baja y suficientemente grande para amortizar
-// la sobrecarga de FreeRTOS por `adc_continuous_read`.
+// DMA read chunk size per iteration. At 48 kHz, 1024 samples ≈ 21 ms:
+// small enough for low latency, large enough to amortise the FreeRTOS
+// overhead of each adc_continuous_read() call.
 #define ADC_FRAME_SIZE        1024
 #define ADC_FRAMES_IN_POOL    4
 #define ADC_READ_BUF_BYTES    (ADC_FRAME_SIZE * SOC_ADC_DIGI_RESULT_BYTES)
@@ -68,9 +77,11 @@ void AFSK_hw_refDetect(void) {
     // TODO quitar
 }
 
-// En ESP32 clásico, dac_continuous y adc_continuous comparten el periférico I2S0
-// internamente, por lo que no pueden estar activos al mismo tiempo.
-// Usamos conmutación half-duplex: el ADC corre durante RX y el DAC durante TX.
+// On classic ESP32, dac_continuous and adc_continuous both use the I2S0
+// peripheral internally for DMA. They cannot be active simultaneously.
+// Half-duplex switching is implemented here: the ADC runs during RX and the
+// DAC during TX. switch_to_tx() stops and deinits the ADC before creating the
+// DAC; switch_to_rx() deletes the DAC before re-creating the ADC.
 
 static void adc_peripheral_start(void) {
     adc_continuous_handle_cfg_t handle_cfg = {
@@ -97,15 +108,17 @@ static void adc_peripheral_start(void) {
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 }
 
-// Un descriptor DAC = buf_size bytes = 2048/48000 s ≈ 42 ms de audio.
-// Con 8 descriptores el DMA tiene ~336 ms de margen frente a preempciones WiFi
-// (prio 23 > prio 10 de receive_audio_task). Si TX_SAMPLE_BUFLEN < buf_size el
-// descriptor dura menos y el DMA puede quedarse sin datos entre escrituras.
+// TX DMA chunk size — must equal dac_continuous buf_size (2048 bytes).
+// Each dac_continuous_write() fills exactly one DMA descriptor (≈42 ms at 48 kHz).
+// With desc_num=8, the pool is ≈336 ms — enough margin to survive WiFi task
+// preemptions (priority 23 vs. receive_audio_task priority 10). Writing less
+// than buf_size per call drains a descriptor in <1 ms, starving subsequent
+// writes and causing dac_continuous_write() to time out.
 #define TX_SAMPLE_BUFLEN 2048
 
-// Cede I2S0 del ADC al DAC para poder transmitir.
-// Llamado siempre desde receive_audio_task (la misma tarea que inició el ADC),
-// por lo que adc_continuous_stop respeta el mutex interno de ESP-IDF.
+// Releases I2S0 from the ADC and hands it to the DAC for transmission.
+// Always called from receive_audio_task (the same task that started the ADC),
+// so adc_continuous_stop() respects the ESP-IDF internal per-handle mutex.
 static void switch_to_tx(void) {
     tx_mode = true;
     ESP_LOGI("AFSK", "switch_to_tx: stopping ADC");
@@ -113,7 +126,7 @@ static void switch_to_tx(void) {
     ESP_ERROR_CHECK(adc_continuous_deinit(adc_handle));
     adc_handle = NULL;
 
-    // Pequeña pausa para que I2S0 se libere completamente antes de que el DAC lo tome.
+    // Brief delay to let I2S0 fully release before the DAC driver claims it.
     vTaskDelay(pdMS_TO_TICKS(20));
 
     dac_continuous_config_t dac_cfg = {
@@ -129,8 +142,8 @@ static void switch_to_tx(void) {
     ESP_ERROR_CHECK(dac_continuous_enable(dac_handle));
     dac_enabled = true;
 
-    // Cebar el DMA con un descriptor completo de silencio para que el oscilador
-    // I2S arranque antes de la primera escritura de audio real.
+    // Prime the DMA with one full descriptor of silence so the I2S oscillator
+    // is running before the first real audio write arrives.
     {
         uint8_t silence[TX_SAMPLE_BUFLEN];
         memset(silence, 128, sizeof(silence));
@@ -138,13 +151,16 @@ static void switch_to_tx(void) {
         dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 500);
     }
 
-    // SIMUL mode configura I2S en estéreo (L→DAC2=GPIO26, R→DAC1=GPIO25).
-    // Reafirmar GPIO26 como salida digital para que PTT siga siendo controlable.
+    // DAC_CHANNEL_MODE_SIMUL drives I2S in stereo: L-channel → DAC1 (GPIO26),
+    // R-channel → DAC0 (GPIO25). GPIO26 doubles as the PTT output. After
+    // dac_continuous_new_channels() the pin is reconfigured to analog mode;
+    // gpio_set_direction() reclaims it as a digital output so PTT level
+    // control works correctly.
     gpio_set_direction(GPIO_PTT_OUT, GPIO_MODE_OUTPUT);
     ESP_LOGI("AFSK", "switch_to_tx: DAC ready");
 }
 
-// Devuelve I2S0 al ADC tras finalizar la transmisión.
+// Returns I2S0 to the ADC after transmission completes.
 static void switch_to_rx(void) {
     if (dac_enabled) {
         dac_continuous_disable(dac_handle);
@@ -159,7 +175,7 @@ static void switch_to_rx(void) {
 }
 
 void AFSK_hw_init(void) {
-    // PTT como salida (activo alto: 1 = TX, 0 = reposo). Inicialmente en reposo.
+    // PTT pin: active-high output (1 = transmitting, 0 = idle). Start idle.
     gpio_config_t ptt_cfg = {
         .pin_bit_mask = 1ULL << GPIO_PTT_OUT,
         .mode         = GPIO_MODE_OUTPUT,
@@ -168,13 +184,13 @@ void AFSK_hw_init(void) {
         .intr_type    = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&ptt_cfg));
-    gpio_set_level(GPIO_PTT_OUT, 0);  // reposo: activo alto → 0 = sin TX
+    gpio_set_level(GPIO_PTT_OUT, 0);  // idle: active-high → 0 = no TX
 
-    // La cola de TX se crea aquí; receive_audio_task arranca el ADC y despacha TX.
+    // TX queue created here; receive_audio_task starts the ADC and dispatches TX.
     s_tx_queue = xQueueCreate(4, sizeof(afsk_tx_frame_t));
 
-    // Tarea de recepción en streaming continuo.
-    // Stack 8192: la tarea también despacha TX (ax25_sendRaw + finish_transmission).
+    // Continuous-streaming receive task.
+    // Stack 8192: the task also handles TX dispatch (ax25_sendRaw + finish_transmission).
     xTaskCreate(receive_audio_task, "receive_audio_task", 8192, NULL, 10, NULL);
 }
 
@@ -218,23 +234,23 @@ static void AFSK_txStart(Afsk *afsk) {
 static uint8_t tx_sample_buf[TX_SAMPLE_BUFLEN];
 uint8_t AFSK_dac_isr(Afsk *afsk);
 
-// Genera un bloque de muestras del modem y lo escribe al DAC continuo.
-// Siempre escribe TX_SAMPLE_BUFLEN bytes: rellena con silencio si la
-// transmisión termina antes de llenar el buffer. Esto mantiene el DMA vivo
-// durante el tiempo necesario para que finish_transmission escriba silencio.
+// Generates one block of modem samples and writes it to the continuous DAC.
+// Always writes TX_SAMPLE_BUFLEN bytes: pads with silence (0x80) if transmission
+// ends before the buffer is full. This keeps the DMA pipeline alive until
+// finish_transmission() writes its own silence tail.
 void transmit_audio_i2s(Afsk *afsk) {
     if (!tx_mode) {
         switch_to_tx();
     }
-    // DAC ya habilitado en switch_to_tx(); no re-habilitar aquí.
-    gpio_set_level(GPIO_PTT_OUT, 1);  // PTT pulsado: activo alto → 1 = TX
+    // DAC already enabled by switch_to_tx(); do not re-enable here.
+    gpio_set_level(GPIO_PTT_OUT, 1);  // assert PTT: active-high → 1 = TX
 
     int i = 0;
     for (i = 0; afsk->sending && i < TX_SAMPLE_BUFLEN; i++) {
         tx_sample_buf[i] = AFSK_dac_isr(afsk);
     }
-    // Rellenar el resto del descriptor con silencio para que el DMA no se
-    // quede sin datos entre esta escritura y las de silencio de finish_transmission.
+    // Pad the remainder of the descriptor with silence so the DMA does not
+    // starve between this write and the silence writes in finish_transmission().
     if (i < TX_SAMPLE_BUFLEN) {
         memset(tx_sample_buf + i, 128, TX_SAMPLE_BUFLEN - i);
     }
@@ -283,9 +299,9 @@ void finish_transmission() {
         transmit_audio_i2s(AFSK_modem);
     }
 
-    // Silencio de cola: un descriptor completo (≈42 ms) es suficiente para que
-    // el demodulador externo cierre la trama. El DMA ya tiene TX_SAMPLE_BUFLEN
-    // bytes de silencio del último bloque generado; este write añade uno más.
+    // Tail silence: one full descriptor (≈42 ms) gives the remote demodulator
+    // time to close the frame. The last sample block already contained silence
+    // padding; this write queues one more descriptor into the DMA.
     {
         uint8_t silence[TX_SAMPLE_BUFLEN];
         memset(silence, 128, sizeof(silence));
@@ -293,9 +309,15 @@ void finish_transmission() {
         dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 2000);
     }
 
-    gpio_set_level(GPIO_PTT_OUT, 0);  // PTT liberado: activo alto → 0 = sin TX
+    // Wait for the DMA to drain all queued descriptors before stopping the DAC.
+    // dac_continuous_disable() inside switch_to_rx() halts the DAC immediately;
+    // without this delay the tail silence is cut short → CRC failure at receiver.
+    // Worst case: desc_num(8) × buf_size(2048) / 48000 Hz ≈ 341 ms.
+    vTaskDelay(pdMS_TO_TICKS(350));
 
-    // Libera I2S0 del DAC y reactiva el ADC para volver al modo recepción.
+    gpio_set_level(GPIO_PTT_OUT, 0);  // release PTT: active-high → 0 = idle
+
+    // Return I2S0 to the ADC and resume reception.
     switch_to_rx();
     ESP_LOGI("AFSK", "custom_preamble=%lu custom_tail=%lu", custom_preamble, custom_tail);
 }
@@ -506,23 +528,18 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
 
 
 void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
-        // Aquí se usa un autocorrelador para detectar los tonos
-    // usando un retraso de 446 uS
-    // 1 segundo son 9600 muestras
-    // 1000000/9600 = 104.16666666666667 uS por muestra
-    // deberemos aplicar un retraso de 446/104.16666666666667 = 4.28 muestras
-    // El retraso se fija en la configuración de la estructura afsk
-
-    // samples per bit = 9600/1200 = 8 -> 8/2 = 4 pero no sé porque lo justifica así
-
-    // >>1 divide por 2, >>2 divide por 4
-
-    // To determine the received frequency, and thereby
-    // the bit of the sample, we multiply the sample by
-    // a sample delayed by (samples per bit / 2).
-    // We then lowpass-filter the samples with a
-    // Chebyshev filter. The lowpass filtering serves
-    // to "smooth out" the variations in the samples.
+        // Frequency discriminator using an autocorrelation technique:
+        // multiply the current sample by a sample delayed by SAMPLESPERBIT/2 = 4
+        // logical samples. At the 9600 Hz logical rate that is 4/9600 ≈ 416 µs.
+        // A positive product indicates a mark tone (1200 Hz); a negative product
+        // indicates a space tone (2200 Hz). The result is low-pass filtered with
+        // a Chebyshev IIR to smooth out noise between transitions.
+        //
+        // Logical sample rate : 9600 Hz → sample period ≈ 104 µs
+        // Delay               : SAMPLESPERBIT/2 = 4 samples → 4/9600 ≈ 416 µs
+        // Samples per bit     : SAMPLERATE / BITRATE = 9600 / 1200 = 8; half = 4
+        //
+        // >>2 divides by 4 (scales the product to prevent IIR overflow).
 
     afsk->iirX[0] = afsk->iirX[1];
     afsk->iirX[1] = ((int8_t)fifo_pop(&afsk->delayFifo) * currentSample) >> 2;
@@ -670,13 +687,16 @@ extern void APRS_poll(void);
 //     }
 // }
 
-// Offset DC estimado con EMA (constante de tiempo ~1024 muestras a 48 kHz ≈ 21 ms).
-// Valor inicial: punto medio del ADC de 12 bits = 2048.
-// Se mantiene en Q10.10 fixed-point para suavizar sin perder precisión.
+// Estimated DC offset, tracked with an EMA (Exponential Moving Average) with a
+// time constant of ~1024 logical samples (at 9600 Hz ≈ 107 ms). The initial
+// value is the mid-scale point of the 12-bit ADC (0..4095 → midpoint 2048).
+// Stored in Q10.10 fixed-point to avoid floating-point arithmetic on the hot path.
 static int32_t dc_offset_q10 = 2048 << 10;
 
-// Convierte una muestra cruda del ADC (0..4095) a int8_t centrado y escalado,
-// aplicando eliminación DC incremental.
+// Converts a raw 12-bit ADC sample (0..4095) to a centred, scaled int8_t,
+// removing the DC component incrementally using the EMA above.
+// After DC removal the range is roughly ±2048; right-shifting by 4 maps it
+// to ±127, fitting the int8_t expected by AFSK_adc_isr.
 static inline int8_t adc_to_s8(uint16_t raw12) {
     dc_offset_q10 += (raw12 - (dc_offset_q10 >> 10));
     int32_t centered = (int32_t)raw12 - (dc_offset_q10 >> 10);  // ~ -2048..2047
@@ -686,23 +706,23 @@ static inline int8_t adc_to_s8(uint16_t raw12) {
     return (int8_t)s;
 }
 
-// Tarea de recepción en modo streaming continuo: cada muestra decimada pasa
-// inmediatamente por el demodulador AFSK, sin acumulaciones ni pausas.
-// Esto es lo que requiere el sincronizador HDLC para detectar flags 0x7E
-// y mantener la fase a lo largo de toda la trama.
+// Continuous-streaming receive task: every decimated logical sample is fed
+// immediately to the AFSK demodulator without buffering or batching.
+// Real-time per-sample processing is required by the HDLC synchroniser to
+// detect 0x7E flags and maintain phase lock across the entire frame.
 void receive_audio_task(void *arg) {
     uint8_t poll_timer = 0;
     int ov_count = 0;
     int32_t ov_sum = 0;
     static uint8_t read_buf[ADC_READ_BUF_BYTES];
 
-    // El ADC se arranca desde esta tarea para que el mutex interno de ESP-IDF
-    // quede asociado a ella. switch_to_tx/rx lo para/arranca siempre desde aquí.
+    // Start the ADC from this task so that the ESP-IDF internal mutex is bound
+    // to it. switch_to_tx/rx always stops/starts the ADC from within this task.
     adc_peripheral_start();
 
     for (;;) {
-        // Despachar trama TX pendiente (encolada por server_task vía afsk_queue_tx_frame).
-        // Al ejecutar desde esta tarea, adc_continuous_stop/start respetan el mutex.
+        // Dispatch any pending TX frame (queued by server_task via afsk_queue_tx_frame).
+        // Running from this task, adc_continuous_stop/start honour the ESP-IDF mutex.
         if (!tx_mode && s_tx_queue && s_tx_fn) {
             afsk_tx_frame_t f;
             if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE) {
@@ -715,6 +735,9 @@ void receive_audio_task(void *arg) {
             continue;
         }
 
+        // 20 ms timeout instead of portMAX_DELAY: allows switch_to_tx() to call
+        // adc_continuous_stop() and unblock this read when a TX frame is dispatched.
+        // With portMAX_DELAY the task would block indefinitely once the ADC stops.
         uint32_t bytes_read = 0;
         esp_err_t err = adc_continuous_read(adc_handle, read_buf, sizeof(read_buf),
                                             &bytes_read, pdMS_TO_TICKS(20));
@@ -724,10 +747,11 @@ void receive_audio_task(void *arg) {
 
         for (uint32_t i = 0; i < bytes_read; i += SOC_ADC_DIGI_RESULT_BYTES) {
             adc_digi_output_data_t *d = (adc_digi_output_data_t *)&read_buf[i];
-            // Filtrar por canal: en modo TYPE1 (ESP32) d->type1.channel indica el canal.
+            // Filter by channel: in TYPE1 format (ESP32) d->type1.channel is the ADC channel.
             if (d->type1.channel != AUDIO_ADC_CHANNEL) continue;
 
-            // Acumular para decimar x OVERSAMPLING (48 kHz → 9600 Hz lógicos).
+            // Accumulate OVERSAMPLING raw samples (48 kHz physical) then average
+            // to produce one logical sample at 9600 Hz for the AFSK demodulator.
             ov_sum += d->type1.data;
             if (++ov_count >= OVERSAMPLING) {
                 uint16_t avg12 = (uint16_t)(ov_sum / OVERSAMPLING);
@@ -738,18 +762,21 @@ void receive_audio_task(void *arg) {
                 int8_t a = sample < 0 ? -sample : sample;
                 if (a > audio_peak) audio_peak = a;
                 AFSK_adc_isr(AFSK_modem, sample);
+                if (s_audio_hook) s_audio_hook(sample);
 
-                // APRS_poll procesa el FIFO rxFifo y dispara el callback si llega trama.
-                // Se llama cada 4 muestras (~2,4 ms a 9600 Hz) para no saturar el loop.
+                // APRS_poll() processes rxFifo and fires the frame callback.
+                // Called every 4 logical samples (≈42 ms at 9600 Hz) to
+                // keep latency low without saturating the loop.
                 if (++poll_timer > 3) {
                     poll_timer = 0;
                     APRS_poll();
                 }
             }
         }
-        // Cede el CPU al menos 1 tick tras procesar cada trama. Sin esto, la tarea
-        // corre en bucle cerrado (el ring buffer del ADC siempre tiene datos) y
-        // IDLE0 nunca puede ejecutar su reset del watchdog.
+        // Yield at least 1 tick after each DMA frame. Without this,
+        // receive_audio_task (priority 10) would spin continuously — the ADC
+        // ring buffer is always non-empty — starving the IDLE task and
+        // triggering the 5-second task watchdog.
         vTaskDelay(1);
     }
 }

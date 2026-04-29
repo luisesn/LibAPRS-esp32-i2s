@@ -1,3 +1,8 @@
+// Arduino compatibility shim for ESP32/ESP-IDF.
+// Provides no-op cli()/sei(), _BV(), identity F(), and a stub HardwareSerial
+// class so the original LibAPRS source compiles unchanged under ESP-IDF.
+// All HardwareSerial methods are empty stubs — no output is produced at runtime.
+
 #define cli() do{}while(0)
 #define sei() do{}while(0)
 

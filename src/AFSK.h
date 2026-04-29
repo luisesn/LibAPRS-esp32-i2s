@@ -11,6 +11,11 @@
 
 #define TRUE_SIN_LEN 512
 #define SIN_LEN (TRUE_SIN_LEN * OVERSAMPLING)
+// sin_table[] stores one quarter-period (0°–90°) of an 8-bit unsigned sine wave,
+// 128 entries (midpoint = 128, peak = 255). sinSample() reconstructs the full
+// 512-sample half-period by mirror symmetry, then applies negation for the second
+// half. With OVERSAMPLING=5 the effective table spans 2560 points, providing
+// adequate spectral purity for Bell 202 AFSK (mark 1200 Hz / space 2200 Hz).
 static const uint8_t sin_table[] =
 {
     128, 129, 131, 132, 134, 135, 137, 138, 140, 142, 143, 145, 146, 148, 149, 151,
@@ -116,6 +121,9 @@ typedef struct Afsk
 
 #define AFSK_DAC_IRQ_START()   do { extern bool hw_afsk_dac_isr; hw_afsk_dac_isr = true; } while (0)
 #define AFSK_DAC_IRQ_STOP()    do { extern bool hw_afsk_dac_isr; hw_afsk_dac_isr = false; } while (0)
+// AVR legacy: configured Port D bits [7:3] as DAC output pins. Not applicable
+// on ESP32; the DAC is managed entirely by the dac_continuous driver.
+// This macro is defined for compatibility but is never called.
 #define AFSK_DAC_INIT()        do { DAC_DDR |= 0xF8; } while (0)
 
 // Here's some macros for controlling the RX/TX LEDs
@@ -146,9 +154,15 @@ void finish_transmission();
 void afsk_putchar(char c);
 int afsk_getchar(void);
 
-// TX dispatch desde receive_audio_task (evita cruce de mutex ADC entre tareas)
+// TX dispatch: set the function that receive_audio_task will call to send a
+// frame. Must be called before APRS_set_raw_hook() to avoid cross-task ADC
+// mutex conflicts (server_task enqueues; receive_audio_task dispatches).
 void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t));
 void afsk_queue_tx_frame(const uint8_t *data, size_t len);
+
+// Hook de audio RX: llamado con cada muestra decimada (int8_t, 9600 Hz).
+// Permite enganchar tareas externas (p.ej. streaming) de forma no bloqueante.
+void afsk_set_audio_hook(void (*fn)(int8_t));
 
 extern Afsk *AFSK_modem;
 extern volatile int8_t audio_peak;

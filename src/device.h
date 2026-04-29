@@ -16,7 +16,7 @@
     #define FREQUENCY_CORRECTION 0
 #endif
 
-// Port settings
+// AVR port register assignments — dead code on ESP32, kept for reference only.
 #if TARGET_CPU == m328p
     #define DAC_PORT PORTD
     #define DAC_DDR  DDRD
@@ -35,26 +35,26 @@
 #define ESP_INTR_FLAG_DEFAULT 0
 
 
-//i2s number
+// Legacy: TNC_I2S_NUM is unused since the switch to dac_continuous/adc_continuous API.
 #define TNC_I2S_NUM           I2S_NUM_0
+
 #define DESIRED_SAMPLE_RATE   (9600)
 #define OVERSAMPLING          (5)
-//i2s sample rate
-#define TNC_I2S_SAMPLE_RATE   (DESIRED_SAMPLE_RATE * OVERSAMPLING)
+// Physical DAC/ADC sample rate = DESIRED_SAMPLE_RATE x OVERSAMPLING = 48 000 Hz.
+// receive_audio_task decimates by OVERSAMPLING (averages 5 raw samples) to produce
+// one logical sample at 9600 Hz for the AFSK demodulator.
+#define TNC_I2S_SAMPLE_RATE        (DESIRED_SAMPLE_RATE * OVERSAMPLING)
 #define CONFIG_AFSK_DAC_SAMPLERATE (TNC_I2S_SAMPLE_RATE)
 
-//i2s data bits
+// Legacy: the following constants are unused since the switch to
+// dac_continuous / adc_continuous API (formerly used by i2s_driver.h).
 #define TNC_I2S_SAMPLE_BITS   (I2S_BITS_PER_SAMPLE_16BIT)
-// 125ms of audio should be plenty I think
 #define TNC_I2S_BUFLEN        (TNC_I2S_SAMPLE_RATE / 8)
-
-//I2S data format
 #define TNC_I2S_FORMAT        (I2S_CHANNEL_FMT_ONLY_RIGHT)
 #define TNC_I2S_CHANNEL_NUM   (1)
 
-//I2S built-in ADC unit
-// Entrada de audio: GPIO 35 (ADC1_CHANNEL_7) y salida en GPIO 25 (DAC1) de la ESP32.
-// Se usa ADC1 (no ADC2) porque ADC2 entra en conflicto con Wi-Fi.
+// Audio input: GPIO 35 (ADC1_CHANNEL_7); audio output: GPIO 25 (DAC0).
+// ADC1 is used (not ADC2) because ADC2 conflicts with Wi-Fi when Wi-Fi is active.
 #define AUDIO_ADC_UNIT            ADC_UNIT_1
 #define AUDIO_ADC_CHANNEL         ADC_CHANNEL_7
 #define AUDIO_ADC_ATTEN           ADC_ATTEN_DB_12   // rango ~0..3,1 V

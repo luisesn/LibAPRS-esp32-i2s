@@ -1,6 +1,10 @@
 #ifndef UTIL_FIFO_H
 #define UTIL_FIFO_H
 
+// Circular FIFO buffer implementation ported from BeRTOS.
+// ATOMIC_BLOCK sections (from avr/atomic.h) are commented out: on ESP32,
+// inter-task safety is handled by FreeRTOS at the call sites that need it.
+
 #include <stddef.h>
 // #include <util/atomic.h>
 

@@ -67,7 +67,7 @@ void ax25_poll(AX25Ctx *ctx) {
             if (ctx->frame_len >= AX25_MIN_FRAME_LEN) {
                 if (ctx->crc_in == AX25_CRC_CORRECT) {
                     if (ctx->raw_hook) {
-                        // Modo KISS TNC: pasar trama cruda sin los 2 bytes de CRC
+                        // KISS TNC mode: deliver the raw frame without the 2 trailing CRC bytes.
                         ctx->raw_hook(ctx->buf, ctx->frame_len - 2);
                     } else {
                         if(LibAPRS_open_squelch) {

@@ -17,13 +17,13 @@ extern "C"
 void APRS_init(int reference, bool open_squelch);
 void APRS_poll(void);
 
-// Registrar callbacks tras APRS_init().
-// Modo APRS clásico: APRS_set_msg_hook(aprs_msg_callback)
-// Modo KISS TNC:     APRS_set_raw_hook(mi_callback_crudo)
+// Register frame callbacks after APRS_init().
+// Classic APRS mode : APRS_set_msg_hook(aprs_msg_callback)
+// KISS TNC mode     : APRS_set_raw_hook(my_raw_callback)
 void APRS_set_msg_hook(ax25_callback_t hook);
 void APRS_set_raw_hook(ax25_raw_callback_t hook);
 
-// Transmitir una trama AX.25 cruda por radio (modo KISS TNC).
+// Transmit a pre-built raw AX.25 frame over the air (KISS TNC mode).
 void APRS_send_raw_frame(const uint8_t *buf, size_t len);
 
 void APRS_setCallsign(char *call, int ssid);
