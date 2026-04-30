@@ -3,16 +3,6 @@
 #ifndef DEVICE_CONFIGURATION
 #define DEVICE_CONFIGURATION
 
-// CPU settings
-#ifndef F_CPU
-    #define F_CPU 16000000
-#endif
-
-#ifndef FREQUENCY_CORRECTION
-    #define FREQUENCY_CORRECTION 0
-#endif
-
-
 #define GPIO_AUDIO_TRIGGER GPIO_NUM_37
 // Audio input pin is controlled by I2S_ADC_CHANNEL below.
 // Audio output pin is hardcoded on hardware as GPIO 25
@@ -34,6 +24,4 @@
 #define AUDIO_ADC_CHANNEL         ADC_CHANNEL_7
 #define AUDIO_ADC_ATTEN           ADC_ATTEN_DB_12   // range ~0..3.1 V
 #define AUDIO_ADC_BITWIDTH        ADC_BITWIDTH_12   // 12-bit: 0..4095
-
-#define KEEP_RECORDING_THRESH  (5)
 #endif // DEVICE_CONFIGURATION

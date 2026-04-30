@@ -6,7 +6,11 @@
 // inter-task safety is handled by FreeRTOS at the call sites that need it.
 
 #include <stddef.h>
-// #include <util/atomic.h>
+#include "freertos/FreeRTOS.h"
+
+// Shared spinlock for FIFO helper functions tagged as _locked.
+// Defined in AFSK.cpp.
+extern portMUX_TYPE g_fifo_mux;
 
 typedef struct FIFOBuffer
 {
@@ -49,31 +53,39 @@ inline void fifo_flush(FIFOBuffer *f) {
 
 inline bool fifo_isempty_locked(const FIFOBuffer *f) {
   bool result;
-  /*ATOMIC_BLOCK(ATOMIC_RESTORESTATE)*/ {
+  taskENTER_CRITICAL(&g_fifo_mux);
+  {
     result = fifo_isempty(f);
   }
+  taskEXIT_CRITICAL(&g_fifo_mux);
   return result;
 }
 
 inline bool fifo_isfull_locked(const FIFOBuffer *f) {
   bool result;
-  /*ATOMIC_BLOCK(ATOMIC_RESTORESTATE)*/ {
+  taskENTER_CRITICAL(&g_fifo_mux);
+  {
     result = fifo_isfull(f);
   }
+  taskEXIT_CRITICAL(&g_fifo_mux);
   return result;
 }
 
 inline void fifo_push_locked(FIFOBuffer *f, unsigned char c) {
-  /*ATOMIC_BLOCK(ATOMIC_RESTORESTATE)*/ {
+  taskENTER_CRITICAL(&g_fifo_mux);
+  {
     fifo_push(f, c);
   }
+  taskEXIT_CRITICAL(&g_fifo_mux);
 }
 
 inline unsigned char fifo_pop_locked(FIFOBuffer *f) {
   unsigned char c;
-  /*ATOMIC_BLOCK(ATOMIC_RESTORESTATE)*/ {
+  taskENTER_CRITICAL(&g_fifo_mux);
+  {
     c = fifo_pop(f);
   }
+  taskEXIT_CRITICAL(&g_fifo_mux);
   return c;
 }
 

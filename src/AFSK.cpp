@@ -18,6 +18,7 @@ extern int LibAPRS_vref;
 
 
 Afsk *AFSK_modem;
+portMUX_TYPE g_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Required by the AFSK_DAC_IRQ_START/STOP macros defined in AFSK.h.
 // On the original AVR port this flag enabled the DAC ISR in hardware.
@@ -40,6 +41,7 @@ static bool dac_enabled = false;
 typedef struct { uint8_t data[AX25_MAX_FRAME_LEN]; size_t len; } afsk_tx_frame_t;
 static QueueHandle_t             s_tx_queue = NULL;
 static void (*s_tx_fn)(const uint8_t *, size_t) = NULL;
+static TaskHandle_t              s_aprs_poll_task = NULL;
 
 void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t)) { s_tx_fn = fn; }
 
@@ -54,6 +56,19 @@ void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
     f.len = len;
     xQueueSendToBack(s_tx_queue, &f, 0);  // non-blocking: drops frame if queue is full
 }
+
+extern void APRS_poll(void);
+
+// Runs APRS_poll() outside the RX sample ingestion loop so user callbacks
+// cannot directly stall receive_audio_task.
+static void aprs_poll_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        APRS_poll();
+        vTaskDelay(1);
+    }
+}
+
 // true while DAC is active (TX); receive_audio_task pauses during this time.
 static volatile bool tx_mode = false;
 
@@ -210,6 +225,9 @@ void AFSK_hw_init(void) {
 
     // TX queue created here; receive_audio_task starts the ADC and dispatches TX.
     s_tx_queue = xQueueCreate(4, sizeof(afsk_tx_frame_t));
+
+    // Keep APRS parsing/callbacks out of the RX hot path.
+    xTaskCreate(aprs_poll_task, "aprs_poll_task", 3072, NULL, 9, &s_aprs_poll_task);
 
     // Continuous-streaming receive task.
     // Stack 8192: the task also handles TX dispatch (ax25_sendRaw + finish_transmission).
@@ -691,8 +709,6 @@ void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
 }
 
 
-extern void APRS_poll(void);
-
 // Estimated DC offset, tracked with an EMA (Exponential Moving Average) with a
 // time constant of ~1024 logical samples (at 9600 Hz ≈ 107 ms). The initial
 // value is the mid-scale point of the 12-bit ADC (0..4095 → midpoint 2048).
@@ -717,7 +733,6 @@ static inline int8_t adc_to_s8(uint16_t raw12) {
 // Real-time per-sample processing is required by the HDLC synchroniser to
 // detect 0x7E flags and maintain phase lock across the entire frame.
 void receive_audio_task(void *arg) {
-    uint8_t poll_timer = 0;
     int ov_count = 0;
     int32_t ov_sum = 0;
     static uint8_t read_buf[ADC_READ_BUF_BYTES];
@@ -769,14 +784,6 @@ void receive_audio_task(void *arg) {
                 if (a > audio_peak) audio_peak = a;
                 AFSK_adc_isr(AFSK_modem, sample);
                 if (s_audio_hook) s_audio_hook(sample);
-
-                // APRS_poll() processes rxFifo and fires the frame callback.
-                // Called every 4 logical samples (≈0.4 ms at 9600 Hz) to
-                // keep latency low without saturating the loop.
-                if (++poll_timer > 3) {
-                    poll_timer = 0;
-                    APRS_poll();
-                }
             }
         }
         // Yield at least 1 tick after each DMA frame. Without this,

@@ -5,6 +5,7 @@
 
 // Afsk modem;
 AX25Ctx AX25;
+static Afsk s_modem;
 #define countof(a) sizeof(a)/sizeof(a[0])
 
 int LibAPRS_vref = REF_3V3;
@@ -55,8 +56,7 @@ void APRS_init(int reference, bool open_squelch) {
     LibAPRS_vref = reference;
     LibAPRS_open_squelch = open_squelch;
 
-    Afsk *modem = (Afsk *)malloc(sizeof(Afsk));
-    AFSK_init(modem);
+    AFSK_init(&s_modem);
     ax25_init(&AX25, NULL);  // registrar hook con APRS_set_msg_hook o APRS_set_raw_hook
 }
 

@@ -44,8 +44,6 @@ inline static uint8_t sinSample(uint16_t i) {
 #define SIGNAL_TRANSITIONED(bits) DUAL_XOR((bits), (bits) >> 2)
 #define TRANSITION_FOUND(bits) BITS_DIFFER((bits), (bits) >> 1)
 
-#define CPU_FREQ F_CPU
-
 #define CONFIG_AFSK_RX_BUFLEN 8192
 #define CONFIG_AFSK_TX_BUFLEN 8192
 #define CONFIG_AFSK_RXTIMEOUT 0
