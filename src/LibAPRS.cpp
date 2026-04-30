@@ -410,3 +410,21 @@ void APRS_queue_ack(const char *to_call, int to_ssid, const char *msg_id)
     int n = snprintf(info, sizeof(info), "ack%s", msg_id);
     if (n > 0) queue_aprs_info(to_call, to_ssid, info, (size_t)n);
 }
+
+void APRS_queue_beacon(const char *info)
+{
+    if (!info) return;
+    size_t info_len = strlen(info);
+    if (info_len > 200) info_len = 200;
+
+    // AX.25 UI frame: [DST:7][SRC:7][PATH1:7][PATH2:7][CTRL:1][PID:1][INFO...]
+    uint8_t frame[30 + 200];
+    encode_call_field(frame +  0, DST,   (uint8_t)DST_SSID,   false);
+    encode_call_field(frame +  7, CALL,  (uint8_t)CALL_SSID,  false);
+    encode_call_field(frame + 14, PATH1, (uint8_t)PATH1_SSID, false);
+    encode_call_field(frame + 21, PATH2, (uint8_t)PATH2_SSID, true);
+    frame[28] = AX25_CTRL_UI;
+    frame[29] = AX25_PID_NOLAYER3;
+    memcpy(frame + 30, info, info_len);
+    afsk_queue_tx_frame(frame, 30 + info_len);
+}

@@ -59,6 +59,10 @@ void APRS_queue_ack(const char *to_call, int to_ssid, const char *msg_id);
 // Copy the active callsign and SSID into caller-supplied buffers.
 // buf_out must be at least 7 bytes; either pointer may be NULL.
 void APRS_getCallsign(char *buf_out, int *ssid_out);
+// Queue a raw APRS beacon (position/status/weather). info must be the
+// complete APRS info field starting with '!', '=', '>', etc.
+// Sends as a UI frame to the configured DST/PATH (broadcast). Safe from any task.
+void APRS_queue_beacon(const char *info);
 void APRS_printSettings();
 
 
