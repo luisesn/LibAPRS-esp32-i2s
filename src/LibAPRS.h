@@ -48,7 +48,11 @@ void APRS_sendPkt(void *_buffer, size_t length);
 void APRS_sendLoc(void *_buffer, size_t length);
 void APRS_sendMsg(void *_buffer, size_t length);
 void APRS_msgRetry();
-
+// Encode and queue an APRS message frame for TX without blocking the calling
+// task. Safe to call from any task (e.g. HTTP handler). Uses afsk_queue_tx_frame
+// internally so it works correctly in KISS TNC mode.
+// to_ssid: 0-15, or -1 to omit the SSID suffix from the destination field.
+void APRS_queue_msg(const char *to_call, int to_ssid, const char *text);
 void APRS_printSettings();
 
 

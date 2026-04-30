@@ -326,3 +326,72 @@ void APRS_msgRetry() {
     message_seq--;
     APRS_sendMsg(lastMessage, lastMessageLen);
 }
+
+// ─── APRS_queue_msg ───────────────────────────────────────────────────────────
+// Builds a complete AX.25 UI frame for an APRS message packet and enqueues it
+// for TX via afsk_queue_tx_frame(). This avoids calling AFSK_transmit directly,
+// which would violate the adc_continuous task-ownership constraint in KISS mode.
+
+static void encode_call_field(uint8_t *buf, const char *call, uint8_t ssid, bool last)
+{
+    for (int i = 0; i < 6; i++) {
+        buf[i] = (uint8_t)((call[i] ? (uint8_t)call[i] : (uint8_t)' ') << 1);
+    }
+    buf[6] = (uint8_t)(0x60u | ((ssid & 0x0Fu) << 1) | (last ? 0x01u : 0x00u));
+}
+
+void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
+{
+    if (!to_call || !text) return;
+
+    // ── Build APRS message payload: ":DEST     :text{NNN}" ────────────────
+    // Destination field is 9 chars wide (callsign + optional -SSID, space-padded).
+    size_t text_len = strlen(text);
+    if (text_len > 67) text_len = 67;
+
+    // Maximum payload: 1 + 9 + 1 + 67 + 4 = 82 bytes
+    uint8_t payload[82];
+    size_t pay_len = 0;
+
+    payload[pay_len++] = ':';
+
+    int count = 0;
+    int call_len = (int)strlen(to_call);
+    if (call_len > 6) call_len = 6;
+    for (int i = 0; i < call_len; i++) { payload[pay_len++] = (uint8_t)to_call[i]; count++; }
+
+    if (to_ssid >= 0 && to_ssid <= 15) {
+        payload[pay_len++] = '-'; count++;
+        if (to_ssid < 10) {
+            payload[pay_len++] = (uint8_t)('0' + to_ssid); count++;
+        } else {
+            payload[pay_len++] = '1'; count++;
+            payload[pay_len++] = (uint8_t)('0' + (to_ssid - 10)); count++;
+        }
+    }
+    while (count < 9) { payload[pay_len++] = ' '; count++; }
+    payload[pay_len++] = ':';
+
+    memcpy(payload + pay_len, text, text_len);
+    pay_len += text_len;
+
+    message_seq++;
+    if (message_seq > 999) message_seq = 0;
+    payload[pay_len++] = '{';
+    payload[pay_len++] = (uint8_t)('0' + message_seq / 100);
+    payload[pay_len++] = (uint8_t)('0' + (message_seq % 100) / 10);
+    payload[pay_len++] = (uint8_t)('0' + message_seq % 10);
+
+    // ── Build AX.25 frame: 4×addr(7) + CTRL(1) + PID(1) + INFO ──────────
+    // Frame size: 28 + 2 + pay_len  (≤112 bytes)
+    uint8_t frame[28 + 2 + 82];
+    encode_call_field(frame +  0, DST,   (uint8_t)DST_SSID,   false);
+    encode_call_field(frame +  7, CALL,  (uint8_t)CALL_SSID,  false);
+    encode_call_field(frame + 14, PATH1, (uint8_t)PATH1_SSID, false);
+    encode_call_field(frame + 21, PATH2, (uint8_t)PATH2_SSID, true);
+    frame[28] = AX25_CTRL_UI;
+    frame[29] = AX25_PID_NOLAYER3;
+    memcpy(frame + 30, payload, pay_len);
+
+    afsk_queue_tx_frame(frame, 30 + pay_len);
+}

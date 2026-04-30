@@ -51,7 +51,7 @@ inline void fifo_flush(FIFOBuffer *f) {
   f->head = f->tail;
 }
 
-inline bool fifo_isempty_locked(const FIFOBuffer *f) {
+static inline bool fifo_isempty_locked(const FIFOBuffer *f) {
   bool result;
   taskENTER_CRITICAL(&g_fifo_mux);
   {
@@ -61,7 +61,7 @@ inline bool fifo_isempty_locked(const FIFOBuffer *f) {
   return result;
 }
 
-inline bool fifo_isfull_locked(const FIFOBuffer *f) {
+static inline bool fifo_isfull_locked(const FIFOBuffer *f) {
   bool result;
   taskENTER_CRITICAL(&g_fifo_mux);
   {
@@ -71,7 +71,7 @@ inline bool fifo_isfull_locked(const FIFOBuffer *f) {
   return result;
 }
 
-inline void fifo_push_locked(FIFOBuffer *f, unsigned char c) {
+static inline void fifo_push_locked(FIFOBuffer *f, unsigned char c) {
   taskENTER_CRITICAL(&g_fifo_mux);
   {
     fifo_push(f, c);
@@ -79,7 +79,7 @@ inline void fifo_push_locked(FIFOBuffer *f, unsigned char c) {
   taskEXIT_CRITICAL(&g_fifo_mux);
 }
 
-inline unsigned char fifo_pop_locked(FIFOBuffer *f) {
+static inline unsigned char fifo_pop_locked(FIFOBuffer *f) {
   unsigned char c;
   taskENTER_CRITICAL(&g_fifo_mux);
   {
