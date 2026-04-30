@@ -771,7 +771,7 @@ void receive_audio_task(void *arg) {
                 if (s_audio_hook) s_audio_hook(sample);
 
                 // APRS_poll() processes rxFifo and fires the frame callback.
-                // Called every 4 logical samples (≈42 ms at 9600 Hz) to
+                // Called every 4 logical samples (≈0.4 ms at 9600 Hz) to
                 // keep latency low without saturating the loop.
                 if (++poll_timer > 3) {
                     poll_timer = 0;

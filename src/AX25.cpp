@@ -24,24 +24,48 @@ void ax25_init(AX25Ctx *ctx, ax25_callback_t hook) {
 
 static void ax25_decode(AX25Ctx *ctx) {
     AX25Msg msg;
+    memset(&msg, 0, sizeof(msg));
+
     uint8_t *buf = ctx->buf;
+    uint8_t *buf_end = ctx->buf + ctx->frame_len;
+
+    if ((buf + 7) > buf_end) return;
 
     DECODE_CALL(buf, msg.dst.call);
+    if (buf >= buf_end) return;
     msg.dst.ssid = (*buf++ >> 1) & 0x0F;
     msg.dst.call[6] = 0;
 
+    if ((buf + 7) > buf_end) return;
     DECODE_CALL(buf, msg.src.call);
+    if (buf >= buf_end) return;
     msg.src.ssid = (*buf >> 1) & 0x0F;
     msg.src.call[6] = 0;
 
-    for (msg.rpt_count = 0; !(*buf++ & 0x01) && (msg.rpt_count < countof(msg.rpt_list)); msg.rpt_count++) {
-        DECODE_CALL(buf, msg.rpt_list[msg.rpt_count].call);
-        //db1sb: terminate rpt_list.call-entries
-        msg.rpt_list[msg.rpt_count].call[6] = 0;
-        msg.rpt_list[msg.rpt_count].ssid = (*buf >> 1) & 0x0F;
-        AX25_SET_REPEATED(&msg, msg.rpt_count, (*buf & 0x80));
+    bool has_repeater = ((*buf & 0x01) == 0);
+    buf++;  // Move from SRC SSID to the next field.
+
+    msg.rpt_count = 0;
+    while (has_repeater) {
+        if ((buf + 7) > buf_end) return;
+
+        if (msg.rpt_count < countof(msg.rpt_list)) {
+            DECODE_CALL(buf, msg.rpt_list[msg.rpt_count].call);
+            //db1sb: terminate rpt_list.call-entries
+            msg.rpt_list[msg.rpt_count].call[6] = 0;
+            msg.rpt_list[msg.rpt_count].ssid = (*buf >> 1) & 0x0F;
+            AX25_SET_REPEATED(&msg, msg.rpt_count, (*buf & 0x80));
+            msg.rpt_count++;
+        } else {
+            // Skip extra repeater addresses in malformed frames without overrunning.
+            buf += 6;
+        }
+
+        has_repeater = ((*buf & 0x01) == 0);
+        buf++;
     }
 
+    if ((buf + 2) > buf_end) return;
     msg.ctrl = *buf++;
     if (msg.ctrl != AX25_CTRL_UI) { return; }
 
