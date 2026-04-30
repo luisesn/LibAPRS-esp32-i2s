@@ -340,26 +340,20 @@ static void encode_call_field(uint8_t *buf, const char *call, uint8_t ssid, bool
     buf[6] = (uint8_t)(0x60u | ((ssid & 0x0Fu) << 1) | (last ? 0x01u : 0x00u));
 }
 
-void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
+// Shared helper: build ":DEST     :info_text" APRS info field, wrap in an
+// AX.25 UI frame using the current CALL/PATH settings and queue it for TX.
+static void queue_aprs_info(const char *to_call, int to_ssid,
+                            const char *info_text, size_t info_len)
 {
-    if (!to_call || !text) return;
-
-    // ── Build APRS message payload: ":DEST     :text{NNN}" ────────────────
-    // Destination field is 9 chars wide (callsign + optional -SSID, space-padded).
-    size_t text_len = strlen(text);
-    if (text_len > 67) text_len = 67;
-
-    // Maximum payload: 1 + 9 + 1 + 67 + 4 = 82 bytes
+    if (info_len > 71) info_len = 71;
+    // payload: ':' + 9-char addr + ':' + info_text  → max 1+9+1+71 = 82
     uint8_t payload[82];
     size_t pay_len = 0;
-
     payload[pay_len++] = ':';
-
     int count = 0;
     int call_len = (int)strlen(to_call);
     if (call_len > 6) call_len = 6;
     for (int i = 0; i < call_len; i++) { payload[pay_len++] = (uint8_t)to_call[i]; count++; }
-
     if (to_ssid >= 0 && to_ssid <= 15) {
         payload[pay_len++] = '-'; count++;
         if (to_ssid < 10) {
@@ -371,19 +365,9 @@ void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
     }
     while (count < 9) { payload[pay_len++] = ' '; count++; }
     payload[pay_len++] = ':';
+    memcpy(payload + pay_len, info_text, info_len);
+    pay_len += info_len;
 
-    memcpy(payload + pay_len, text, text_len);
-    pay_len += text_len;
-
-    message_seq++;
-    if (message_seq > 999) message_seq = 0;
-    payload[pay_len++] = '{';
-    payload[pay_len++] = (uint8_t)('0' + message_seq / 100);
-    payload[pay_len++] = (uint8_t)('0' + (message_seq % 100) / 10);
-    payload[pay_len++] = (uint8_t)('0' + message_seq % 10);
-
-    // ── Build AX.25 frame: 4×addr(7) + CTRL(1) + PID(1) + INFO ──────────
-    // Frame size: 28 + 2 + pay_len  (≤112 bytes)
     uint8_t frame[28 + 2 + 82];
     encode_call_field(frame +  0, DST,   (uint8_t)DST_SSID,   false);
     encode_call_field(frame +  7, CALL,  (uint8_t)CALL_SSID,  false);
@@ -392,6 +376,37 @@ void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
     frame[28] = AX25_CTRL_UI;
     frame[29] = AX25_PID_NOLAYER3;
     memcpy(frame + 30, payload, pay_len);
-
     afsk_queue_tx_frame(frame, 30 + pay_len);
+}
+
+void APRS_getCallsign(char *buf_out, int *ssid_out)
+{
+    if (buf_out) { strncpy(buf_out, CALL, 6); buf_out[6] = '\0'; }
+    if (ssid_out) *ssid_out = CALL_SSID;
+}
+
+void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
+{
+    if (!to_call || !text) return;
+    size_t text_len = strlen(text);
+    if (text_len > 67) text_len = 67;
+
+    // Append {NNN} message sequence number after text
+    char info[67 + 4 + 1];
+    memcpy(info, text, text_len);
+    message_seq++;
+    if (message_seq > 999) message_seq = 0;
+    info[text_len]     = '{';
+    info[text_len + 1] = (char)('0' + message_seq / 100);
+    info[text_len + 2] = (char)('0' + (message_seq % 100) / 10);
+    info[text_len + 3] = (char)('0' + message_seq % 10);
+    queue_aprs_info(to_call, to_ssid, info, text_len + 4);
+}
+
+void APRS_queue_ack(const char *to_call, int to_ssid, const char *msg_id)
+{
+    if (!to_call || !msg_id) return;
+    char info[10]; // "ack" + up to 5 digits
+    int n = snprintf(info, sizeof(info), "ack%s", msg_id);
+    if (n > 0) queue_aprs_info(to_call, to_ssid, info, (size_t)n);
 }

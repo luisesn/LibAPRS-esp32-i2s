@@ -53,6 +53,12 @@ void APRS_msgRetry();
 // internally so it works correctly in KISS TNC mode.
 // to_ssid: 0-15, or -1 to omit the SSID suffix from the destination field.
 void APRS_queue_msg(const char *to_call, int to_ssid, const char *text);
+// Queue an APRS ACK for a received message. msg_id is the numeric ID string
+// from the incoming {NNN} field (e.g. "042"). Builds ":DEST     :ackNNN".
+void APRS_queue_ack(const char *to_call, int to_ssid, const char *msg_id);
+// Copy the active callsign and SSID into caller-supplied buffers.
+// buf_out must be at least 7 bytes; either pointer may be NULL.
+void APRS_getCallsign(char *buf_out, int *ssid_out);
 void APRS_printSettings();
 
 
