@@ -11,6 +11,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include <math.h>
+#include "morse.h"
 
 extern unsigned long custom_preamble;
 extern unsigned long custom_tail;
@@ -360,6 +361,36 @@ void finish_transmission() {
     // Return I2S0 to the ADC and resume reception.
     switch_to_rx();
     ESP_LOGI("AFSK", "custom_preamble=%lu custom_tail=%lu", custom_preamble, custom_tail);
+}
+
+// ---------------------------------------------------------------------------
+// Morse beacon DAC primitives (declared in AFSK.h, called from morse.c)
+// Must be invoked from receive_audio_task to respect the I2S0 mutex.
+// ---------------------------------------------------------------------------
+void afsk_morse_tx_begin(void) {
+    switch_to_tx();
+    gpio_set_level(GPIO_PTT_OUT, 1);  // PTT active-high
+}
+
+void afsk_morse_tx_frame(const uint8_t *buf) {
+    size_t bw = 0;
+    esp_err_t err = dac_continuous_write(dac_handle, (uint8_t *)buf,
+                                         TX_SAMPLE_BUFLEN, &bw, 2000);
+    if (err != ESP_OK) {
+        ESP_LOGE("AFSK", "morse dac_write: %s", esp_err_to_name(err));
+    }
+}
+
+void afsk_morse_tx_end(void) {
+    // One full descriptor of tail silence so the remote demodulator
+    // can settle before PTT drops.
+    uint8_t silence[TX_SAMPLE_BUFLEN];
+    memset(silence, 128, sizeof(silence));
+    size_t bw = 0;
+    dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 2000);
+    vTaskDelay(pdMS_TO_TICKS(350));
+    gpio_set_level(GPIO_PTT_OUT, 0);  // PTT idle
+    switch_to_rx();
 }
 
 uint8_t AFSK_dac_isr(Afsk *afsk) {
@@ -749,6 +780,11 @@ void receive_audio_task(void *arg) {
             if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE) {
                 s_tx_fn(f.data, f.len);
             }
+        }
+
+        // Morse beacon dispatch: must run from this task (I2S0 mutex).
+        if (!tx_mode) {
+            morse_check_and_dispatch();
         }
 
         if (tx_mode) {

@@ -170,6 +170,14 @@ void AFSK_set_leds(int gpio_tx, int gpio_rx);
 // Allows attaching external tasks (e.g. audio streaming) in a non-blocking way.
 void afsk_set_audio_hook(void (*fn)(int8_t));
 
+// Morse beacon DAC primitives.
+// All three MUST be called from receive_audio_task (I2S0 mutex ownership).
+// AFSK_DAC_FRAME_SIZE bytes are written per afsk_morse_tx_frame() call.
+#define AFSK_DAC_FRAME_SIZE  2048   /* matches TX_SAMPLE_BUFLEN */
+void afsk_morse_tx_begin(void);              // switch_to_tx() + PTT high
+void afsk_morse_tx_frame(const uint8_t *buf);// write one 2048-byte DAC frame
+void afsk_morse_tx_end(void);               // tail silence + PTT low + switch_to_rx()
+
 extern Afsk *AFSK_modem;
 extern volatile int8_t audio_peak;
 
