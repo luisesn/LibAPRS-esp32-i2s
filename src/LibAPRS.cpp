@@ -1,12 +1,88 @@
 #include "FakeArduino.h"
 #include "AFSK.h"
 #include "AX25.h"
+#include "HDLC.h"
+#include "CRC-CCIT.h"
 #include "LibAPRS.h"
+#include "rx_stats.h"
+#include "aux_config.h"
+#include "cJSON.h"
 
 // Afsk modem;
 AX25Ctx AX25;
 static Afsk s_modem;
 #define countof(a) sizeof(a)/sizeof(a[0])
+
+// ─── V2 dual-modem support ────────────────────────────────────────────────────
+
+static AX25Ctx s_ax25_v2;
+static bool    s_v2_ctx_init     = false;
+// 0 = "original" (v1 only), 1 = "v2" (v2 only), 2 = "best" (both deliver frames)
+static int     s_active_modem    = 2;
+// Application-level raw frame callback (set via APRS_set_raw_hook)
+static ax25_raw_callback_t s_app_raw_hook = NULL;
+
+// V1 shim: intercepts v1 CRC-OK frames for stats and arbiter filtering.
+static void v1_raw_shim(const uint8_t *buf, size_t len) {
+    rx_stats_v1.frames_crc_ok += 1;
+    if (s_active_modem != 1 && s_app_raw_hook)  // deliver unless "v2-only" mode
+        s_app_raw_hook(buf, len);
+}
+
+// Inline poll for v2 FIFO (avoids touching AX25.cpp).
+// Replicates ax25_poll logic using afsk_getchar_v2().
+static void aprs_poll_v2(void) {
+    if (!AFSK_modem_v2) return;
+
+    // Lazy-init the v2 AX25 context
+    if (!s_v2_ctx_init) {
+        ax25_init(&s_ax25_v2, NULL);
+        // Read active_modem from config
+        cJSON *cfg = config_get();
+        if (cfg) {
+            cJSON *rx = cJSON_GetObjectItem(cfg, "rx");
+            if (rx) {
+                cJSON *am = cJSON_GetObjectItem(rx, "active_modem");
+                if (cJSON_IsString(am)) {
+                    if (strcmp(am->valuestring, "v2") == 0)       s_active_modem = 1;
+                    else if (strcmp(am->valuestring, "original") == 0) s_active_modem = 0;
+                    else                                           s_active_modem = 2;
+                }
+            }
+        }
+        s_v2_ctx_init = true;
+    }
+
+    int c;
+    while ((c = afsk_getchar_v2()) != EOF) {
+        if (!s_ax25_v2.escape && c == HDLC_FLAG) {
+            if (s_ax25_v2.frame_len >= AX25_MIN_FRAME_LEN) {
+                if (s_ax25_v2.crc_in == AX25_CRC_CORRECT) {
+                    rx_stats_v2.frames_crc_ok += 1;
+                    if (s_active_modem != 0 && s_app_raw_hook)  // deliver unless "original-only"
+                        s_app_raw_hook(s_ax25_v2.buf, s_ax25_v2.frame_len - 2);
+                } else {
+                    rx_stats_v2.frames_crc_err += 1;
+                }
+            }
+            s_ax25_v2.sync      = true;
+            s_ax25_v2.crc_in    = CRC_CCIT_INIT_VAL;
+            s_ax25_v2.frame_len = 0;
+            continue;
+        }
+        if (!s_ax25_v2.escape && c == HDLC_RESET) { s_ax25_v2.sync = false; continue; }
+        if (!s_ax25_v2.escape && c == AX25_ESC)   { s_ax25_v2.escape = true; continue; }
+        if (s_ax25_v2.sync) {
+            if (s_ax25_v2.frame_len < AX25_MAX_FRAME_LEN) {
+                s_ax25_v2.buf[s_ax25_v2.frame_len++] = (uint8_t)c;
+                s_ax25_v2.crc_in = update_crc_ccit((uint8_t)c, s_ax25_v2.crc_in);
+            } else {
+                s_ax25_v2.sync = false;
+            }
+        }
+        s_ax25_v2.escape = false;
+    }
+}
 
 int LibAPRS_vref = REF_3V3;
 bool LibAPRS_open_squelch = false;
@@ -62,6 +138,7 @@ void APRS_init(int reference, bool open_squelch) {
 
 void APRS_poll(void) {
     ax25_poll(&AX25);
+    aprs_poll_v2();
 }
 
 void APRS_set_msg_hook(ax25_callback_t hook) {
@@ -69,7 +146,8 @@ void APRS_set_msg_hook(ax25_callback_t hook) {
 }
 
 void APRS_set_raw_hook(ax25_raw_callback_t hook) {
-    AX25.raw_hook = hook;
+    s_app_raw_hook = hook;
+    AX25.raw_hook  = (hook != NULL) ? v1_raw_shim : NULL;
 }
 
 void APRS_send_raw_frame(const uint8_t *buf, size_t len) {

@@ -179,7 +179,13 @@ void afsk_morse_tx_frame(const uint8_t *buf);// write one 2048-byte DAC frame
 void afsk_morse_tx_end(void);               // tail silence + PTT low + switch_to_rx()
 
 extern Afsk *AFSK_modem;
+extern Afsk *AFSK_modem_v2;       // NULL when dual modem is disabled
 extern volatile int8_t audio_peak;
+extern volatile int32_t afsk_v2_agc_peak;    // AGC peak in ADC counts (for /api/rx/stats)
+extern volatile bool    afsk_v2_squelch_open; // current squelch state
+
+// Read one byte from AFSK_modem_v2->rxFifo; returns EOF when empty or v2 disabled.
+int afsk_getchar_v2(void);
 
 #ifdef __cplusplus
 } // extern "C"

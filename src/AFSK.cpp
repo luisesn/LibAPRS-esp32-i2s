@@ -12,6 +12,9 @@
 #include "esp_log.h"
 #include <math.h>
 #include "morse.h"
+#include "rx_stats.h"
+#include "aux_config.h"
+#include "cJSON.h"
 
 extern unsigned long custom_preamble;
 extern unsigned long custom_tail;
@@ -19,6 +22,46 @@ extern int LibAPRS_vref;
 
 
 Afsk *AFSK_modem;
+Afsk *AFSK_modem_v2 = NULL;
+static Afsk afsk_v2_instance;
+
+// Runtime config for dual modem (read from config.json "rx" section)
+static bool s_dual_modem_enabled = false;
+static int  s_squelch_threshold  = 64;
+static bool s_deemphasis_enabled = false;
+
+// Stats routing pointer: set to &rx_stats_v1 or &rx_stats_v2 before each
+// hdlcParse call so the common function can instrument the right counter set.
+static RxStats *s_cur_stats = NULL;
+
+// FIR decimation for v2 (Hann window, sum=256, replaces simple average)
+static const int16_t fir5[OVERSAMPLING] = { 6, 58, 128, 58, 6 };
+static uint16_t v2_fir_buf[OVERSAMPLING];
+
+// V2 bandpass biquad state (1700 Hz centre, Q=2, Q15 coefficients)
+static int32_t bp_x1 = 0, bp_x2 = 0, bp_y1 = 0, bp_y2 = 0;
+
+// V2 post-discriminator 2nd-order Butterworth LP state (extra samples v1 doesn't need)
+static int32_t s_v2_disc_x0 = 0, s_v2_disc_x1 = 0;
+static int32_t s_v2_disc_y0 = 0, s_v2_disc_y1 = 0;
+static int32_t s_v2_lp_x2   = 0, s_v2_lp_y2   = 0;
+
+// V2 de-emphasis and AGC state
+static int32_t s_v2_deemph_state = 0;
+static int32_t dc_offset_v2_q10  = 2048 << 10;
+static int32_t agc_env_q6        = 32 << 6;
+
+// V2 squelch power estimator
+static int32_t s_v2_squelch_power = 0;
+
+// V2 fast clock-sync state
+static int  v2_hdlc_flags_seen = 0;
+static bool v2_was_receiving   = false;
+
+// Exported for /api/rx/stats
+volatile int32_t afsk_v2_agc_peak     = 0;
+volatile bool    afsk_v2_squelch_open = false;
+
 portMUX_TYPE g_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Required by the AFSK_DAC_IRQ_START/STOP macros defined in AFSK.h.
@@ -223,6 +266,40 @@ void AFSK_hw_init(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&ptt_cfg));
     gpio_set_level(GPIO_PTT_OUT, 0);  // idle: active-high → 0 = no TX
+
+    // Always enable v1 stats tracking
+    s_cur_stats = &rx_stats_v1;
+
+    // Read rx config
+    cJSON *cfg = config_get();
+    if (cfg) {
+        cJSON *rx = cJSON_GetObjectItem(cfg, "rx");
+        if (rx) {
+            cJSON *it;
+            it = cJSON_GetObjectItem(rx, "dual_modem_enabled");
+            if (cJSON_IsBool(it)) s_dual_modem_enabled = cJSON_IsTrue(it);
+            it = cJSON_GetObjectItem(rx, "squelch_threshold");
+            if (cJSON_IsNumber(it)) s_squelch_threshold = (int)it->valuedouble;
+            it = cJSON_GetObjectItem(rx, "deemphasis_enabled");
+            if (cJSON_IsBool(it)) s_deemphasis_enabled = cJSON_IsTrue(it);
+        }
+    }
+
+    if (s_dual_modem_enabled) {
+        memset(&afsk_v2_instance, 0, sizeof(afsk_v2_instance));
+        AFSK_modem_v2 = &afsk_v2_instance;
+        AFSK_modem_v2->phaseInc = MARK_INC;
+        fifo_init(&AFSK_modem_v2->delayFifo,
+                  (uint8_t *)AFSK_modem_v2->delayBuf,
+                  sizeof(AFSK_modem_v2->delayBuf));
+        fifo_init(&AFSK_modem_v2->rxFifo,
+                  AFSK_modem_v2->rxBuf,
+                  sizeof(AFSK_modem_v2->rxBuf));
+        for (int i = 0; i < SAMPLESPERBIT / 2; i++)
+            fifo_push(&AFSK_modem_v2->delayFifo, 0);
+        ESP_LOGI("AFSK", "V2 dual modem enabled (squelch=%d deemph=%d)",
+                 s_squelch_threshold, (int)s_deemphasis_enabled);
+    }
 
     // TX queue created here; receive_audio_task starts the ADC and dispatches TX.
     s_tx_queue = xQueueCreate(4, sizeof(afsk_tx_frame_t));
@@ -470,6 +547,7 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
     // Now we'll look at the last 8 received bits, and
     // check if we have received a HDLC flag (01111110)
     if (hdlc->demodulatedBits == HDLC_FLAG) {
+        if (s_cur_stats) s_cur_stats->hdlc_flags += 1;
         // If we have, check that our output buffer is
         // not full.
         if (!fifo_isfull(fifo)) {
@@ -484,7 +562,7 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
             // If the buffer is full, we have a problem
             // and abort by setting the return value to
             // false and stopping the here.
-
+            if (s_cur_stats) s_cur_stats->fifo_overflows += 1;
             ret = false;
             hdlc->receiving = false;
             LED_RX_OFF();
@@ -566,6 +644,7 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
                 fifo_push(fifo, AX25_ESC);
             } else {
                 // If it is, abort and return false
+                if (s_cur_stats) s_cur_stats->fifo_overflows += 1;
                 hdlc->receiving = false;
                 LED_RX_OFF();
                 ret = false;
@@ -578,6 +657,7 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
             fifo_push(fifo, hdlc->currentByte);
         } else {
             // If it is, well, you know by now!
+            if (s_cur_stats) s_cur_stats->fifo_overflows += 1;
             hdlc->receiving = false;
             LED_RX_OFF();
             ret = false;
@@ -599,6 +679,7 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
 
 
 void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
+        s_cur_stats = &rx_stats_v1;
         // Frequency discriminator using an autocorrelation technique:
         // multiply the current sample by a sample delayed by SAMPLESPERBIT/2 = 4
         // logical samples. At the 9600 Hz logical rate that is 4/9600 ≈ 416 µs.
@@ -759,6 +840,141 @@ static inline int8_t adc_to_s8(uint16_t raw12) {
     return (int8_t)s;
 }
 
+// ─── V2 modem: AGC + filters + improvements ──────────────────────────────────
+
+// AGC-enhanced sample converter for v2. DC removal uses the same EMA approach
+// as adc_to_s8; an additional envelope follower normalises the output to ~75 %
+// of full scale (±96) regardless of the input signal level.
+static inline int8_t adc_to_s8_v2(uint16_t raw12) {
+    dc_offset_v2_q10 += (raw12 - (dc_offset_v2_q10 >> 10));
+    int32_t centered = (int32_t)raw12 - (dc_offset_v2_q10 >> 10);
+    int32_t abs_c = centered < 0 ? -centered : centered;
+    // Asymmetric EMA: fast attack (~8 samples), slow decay (~512 samples)
+    if ((abs_c << 6) > agc_env_q6)
+        agc_env_q6 += ((abs_c << 6) - agc_env_q6) >> 3;
+    else
+        agc_env_q6 += ((abs_c << 6) - agc_env_q6) >> 9;
+    int32_t peak = agc_env_q6 >> 6;
+    if (peak < 4)   peak = 4;    // max gain ~24×
+    if (peak > 512) peak = 512;  // min gain (ADC full range)
+    afsk_v2_agc_peak = peak;
+    int32_t s = (centered * 96) / peak;
+    if (s < -127) s = -127;
+    if (s >  127) s =  127;
+    return (int8_t)s;
+}
+
+// Bandpass biquad: centre 1700 Hz, Q=2, @ 9600 Hz (Q15)
+// Passes the Bell-202 window (1200–2200 Hz), rejects out-of-band noise.
+static const int32_t BP_B0 =  14871;
+static const int32_t BP_B2 = -14871;
+static const int32_t BP_A1 = -12058;
+static const int32_t BP_A2 =  17897;
+
+static inline int8_t afsk_bandpass_v2(int8_t in) {
+    int32_t x0 = in;
+    int32_t y0 = (BP_B0 * x0 + BP_B2 * bp_x2
+                  - BP_A1 * bp_y1 - BP_A2 * bp_y2) >> 15;
+    bp_x2 = bp_x1; bp_x1 = x0;
+    bp_y2 = bp_y1; bp_y1 = y0;
+    if (y0 < -128) y0 = -128;
+    if (y0 >  127) y0 =  127;
+    return (int8_t)y0;
+}
+
+// Pre-emphasis filter (1st order high-shelf) that compensates for the
+// de-emphasis applied by FM receivers before the discriminator output.
+// α ≈ 64/256 (τ ≈ 75 µs at 9600 Hz).  Only active when s_deemphasis_enabled.
+static inline int8_t afsk_deemph_v2(int8_t in) {
+    s_v2_deemph_state = ((256 - 64) * (int32_t)in + 64 * s_v2_deemph_state) >> 8;
+    int32_t out = (int32_t)in - s_v2_deemph_state;
+    if (out < -128) out = -128;
+    if (out >  127) out =  127;
+    return (int8_t)out;
+}
+
+// 2nd-order Butterworth LP post-discriminator, cutoff 600 Hz @ 9600 Hz (Q15).
+// Replaces the 1st-order Chebyshev used in v1.
+static const int32_t LP_B0 =  1048;
+static const int32_t LP_B1 =  2097;
+static const int32_t LP_B2 =  1048;
+static const int32_t LP_A1 = -23148;
+static const int32_t LP_A2 =  7339;
+
+// V2 demodulator: same structure as AFSK_adc_isr with the following changes:
+//   Phase 1a — 5-bit majority voter (vs 3-bit in v1)
+//   Phase 1b — aggressive phase-lock during first 4 HDLC flags
+//   Phase 3b — bandpass IIR before the correlator
+//   Phase 3c — 2nd-order Butterworth LP after the correlator
+//   Phase 5  — optional pre-emphasis
+static void afsk_v2_process(Afsk *afsk, int8_t currentSample) {
+    s_cur_stats = &rx_stats_v2;
+
+    if (s_deemphasis_enabled)
+        currentSample = afsk_deemph_v2(currentSample);
+
+    // Phase 3b: bandpass before correlator
+    currentSample = afsk_bandpass_v2(currentSample);
+
+    // Correlator (same as v1)
+    s_v2_disc_x0 = s_v2_disc_x1;
+    s_v2_disc_x1 = ((int8_t)fifo_pop(&afsk->delayFifo) * currentSample) >> 2;
+
+    // Phase 3c: 2nd-order Butterworth LP (replaces v1 Chebyshev)
+    s_v2_disc_y0 = s_v2_disc_y1;
+    s_v2_disc_y1 = (LP_B0 * s_v2_disc_x1 + LP_B1 * s_v2_disc_x0 + LP_B2 * s_v2_lp_x2
+                    - LP_A1 * s_v2_disc_y0 - LP_A2 * s_v2_lp_y2) >> 15;
+    s_v2_lp_x2 = s_v2_disc_x0;
+    s_v2_lp_y2 = s_v2_disc_y0;
+
+    afsk->sampledBits <<= 1;
+    afsk->sampledBits |= (s_v2_disc_y1 > 0) ? 1 : 0;
+
+    fifo_push(&afsk->delayFifo, currentSample);
+
+    // Phase 1b: faster phase acquisition during preamble (first 4 HDLC flags)
+    int phase_inc_v2 = (v2_hdlc_flags_seen < 4) ? 2 : 1;
+    if (SIGNAL_TRANSITIONED(afsk->sampledBits)) {
+        if (afsk->currentPhase < PHASE_THRESHOLD)
+            afsk->currentPhase += phase_inc_v2;
+        else
+            afsk->currentPhase -= phase_inc_v2;
+    }
+
+    afsk->currentPhase += PHASE_BITS;
+
+    if (afsk->currentPhase >= PHASE_MAX) {
+        afsk->currentPhase %= PHASE_MAX;
+        afsk->actualBits <<= 1;
+
+        // Phase 1a: 5-bit majority voter
+        uint8_t bits5 = afsk->sampledBits & 0x1f;
+        if (__builtin_popcount(bits5) >= 3)
+            afsk->actualBits |= 1;
+
+        bool was_receiving = afsk->hdlc.receiving;
+        if (!hdlcParse(&afsk->hdlc, !TRANSITION_FOUND(afsk->actualBits), &afsk->rxFifo)) {
+            afsk->status |= 1;
+            if (fifo_isfull(&afsk->rxFifo)) {
+                fifo_flush(&afsk->rxFifo);
+                afsk->status = 0;
+            }
+        }
+        // Reset fast-sync counter when a frame ends
+        if (was_receiving && !afsk->hdlc.receiving)
+            v2_hdlc_flags_seen = 0;
+        // Track flag count for Phase 1b
+        v2_was_receiving = afsk->hdlc.receiving;
+    }
+    (void)v2_was_receiving;
+}
+
+int afsk_getchar_v2(void) {
+    if (!AFSK_modem_v2 || fifo_isempty_locked(&AFSK_modem_v2->rxFifo))
+        return EOF;
+    return fifo_pop_locked(&AFSK_modem_v2->rxFifo);
+}
+
 // Continuous-streaming receive task: every decimated logical sample is fed
 // immediately to the AFSK demodulator without buffering or batching.
 // Real-time per-sample processing is required by the HDLC synchroniser to
@@ -809,17 +1025,41 @@ void receive_audio_task(void *arg) {
 
             // Accumulate OVERSAMPLING raw samples (48 kHz physical) then average
             // to produce one logical sample at 9600 Hz for the AFSK demodulator.
+            // Also fill FIR buffer for v2 (same window, weighted instead of flat).
+            if (AFSK_modem_v2)
+                v2_fir_buf[ov_count] = d->type1.data;
+
             ov_sum += d->type1.data;
             if (++ov_count >= OVERSAMPLING) {
                 uint16_t avg12 = (uint16_t)(ov_sum / OVERSAMPLING);
                 ov_sum = 0;
                 ov_count = 0;
 
+                // V1 path (unchanged)
                 int8_t sample = adc_to_s8(avg12);
                 int8_t a = sample < 0 ? -sample : sample;
                 if (a > audio_peak) audio_peak = a;
                 AFSK_adc_isr(AFSK_modem, sample);
                 if (s_audio_hook) s_audio_hook(sample);
+
+                // V2 path: FIR decimation + AGC + squelch
+                if (AFSK_modem_v2) {
+                    int32_t acc = 0;
+                    for (int k = 0; k < OVERSAMPLING; k++)
+                        acc += (int32_t)fir5[k] * v2_fir_buf[k];
+                    uint16_t avg12_v2 = (uint16_t)(acc >> 8);
+
+                    int8_t s8_v2 = adc_to_s8_v2(avg12_v2);
+
+                    // Squelch: power EMA on AGC output
+                    s_v2_squelch_power +=
+                        ((int32_t)s8_v2 * s8_v2 - s_v2_squelch_power) >> 8;
+                    afsk_v2_squelch_open =
+                        (s_v2_squelch_power > s_squelch_threshold);
+
+                    if (afsk_v2_squelch_open)
+                        afsk_v2_process(AFSK_modem_v2, s8_v2);
+                }
             }
         }
         // Yield at least 1 tick after each DMA frame. Without this,
