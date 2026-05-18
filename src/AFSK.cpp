@@ -11,7 +11,6 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include <math.h>
-#include "morse.h"
 #include "rx_stats.h"
 #include "aux_config.h"
 #include "cJSON.h"
@@ -91,6 +90,9 @@ void afsk_set_tx_fn(void (*fn)(const uint8_t *, size_t)) { s_tx_fn = fn; }
 
 static void (*s_audio_hook)(int8_t) = NULL;
 void afsk_set_audio_hook(void (*fn)(int8_t)) { s_audio_hook = fn; }
+
+static void (*s_dispatch_hook)(void) = NULL;
+void afsk_set_dispatch_hook(void (*fn)(void)) { s_dispatch_hook = fn; }
 
 void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
     if (!s_tx_queue || !data || len == 0) return;
@@ -241,6 +243,8 @@ static void switch_to_tx(void) {
     ESP_LOGI("AFSK", "switch_to_tx: DAC ready");
 }
 
+extern "C" void afsk_switch_to_tx(void) { switch_to_tx(); }
+
 // Returns I2S0 to the ADC after transmission completes.
 static void switch_to_rx(void) {
     if (dac_enabled) {
@@ -253,6 +257,16 @@ static void switch_to_rx(void) {
     adc_peripheral_start();
     tx_mode = false;
     printf("Switched back to RX mode.\n");
+}
+
+extern "C" void afsk_switch_to_rx(void) { switch_to_rx(); }
+
+extern "C" esp_err_t afsk_write_dac_block(const uint8_t *buf, size_t len,
+                                           uint32_t timeout_ms) {
+    if (!dac_enabled || !dac_handle) return ESP_ERR_INVALID_STATE;
+    size_t bw = 0;
+    return dac_continuous_write(dac_handle, (uint8_t *)buf, len, &bw,
+                                pdMS_TO_TICKS(timeout_ms));
 }
 
 void AFSK_hw_init(void) {
@@ -998,9 +1012,10 @@ void receive_audio_task(void *arg) {
             }
         }
 
-        // Morse beacon dispatch: must run from this task (I2S0 mutex).
-        if (!tx_mode) {
-            morse_check_and_dispatch();
+        // Dispatch hook: project-level TX work (Morse, SSTV, …) that must run
+        // from this task to satisfy the I2S0 DAC mutex ownership requirement.
+        if (!tx_mode && s_dispatch_hook) {
+            s_dispatch_hook();
         }
 
         if (tx_mode) {

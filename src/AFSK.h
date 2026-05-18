@@ -170,6 +170,16 @@ void AFSK_set_leds(int gpio_tx, int gpio_rx);
 // Allows attaching external tasks (e.g. audio streaming) in a non-blocking way.
 void afsk_set_audio_hook(void (*fn)(int8_t));
 
+// Dispatch hook: called once per receive_audio_task iteration when not in TX.
+// Register project-level periodic work here (e.g. Morse, SSTV) to avoid
+// #include-ing project headers from the library.
+void afsk_set_dispatch_hook(void (*fn)(void));
+
+// DAC control primitives for non-AFSK TX modes (SSTV, Morse, etc.).
+void      afsk_switch_to_tx(void);
+void      afsk_switch_to_rx(void);
+esp_err_t afsk_write_dac_block(const uint8_t *buf, size_t len, uint32_t timeout_ms);
+
 // Morse beacon DAC primitives.
 // All three MUST be called from receive_audio_task (I2S0 mutex ownership).
 // AFSK_DAC_FRAME_SIZE bytes are written per afsk_morse_tx_frame() call.
