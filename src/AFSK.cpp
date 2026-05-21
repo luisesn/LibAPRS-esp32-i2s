@@ -306,7 +306,7 @@ static void switch_to_rx(void) {
 
     adc_peripheral_start();
     tx_mode = false;
-    printf("Switched back to RX mode.\n");
+    ESP_LOGI("AFSK", "Switched to RX mode");
 }
 
 extern "C" void afsk_switch_to_rx(void) { switch_to_rx(); }
