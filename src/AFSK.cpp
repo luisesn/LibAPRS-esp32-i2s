@@ -94,6 +94,11 @@ void afsk_set_audio_hook(void (*fn)(int8_t)) { s_audio_hook = fn; }
 static void (*s_dispatch_hook)(void) = NULL;
 void afsk_set_dispatch_hook(void (*fn)(void)) { s_dispatch_hook = fn; }
 
+static uint32_t   s_post_rx_tx_delay_ms = 0;
+static TickType_t s_last_rx_tick        = 0;
+void afsk_set_post_rx_tx_delay_ms(uint32_t ms) { s_post_rx_tx_delay_ms = ms; }
+void afsk_notify_rx_frame(void) { s_last_rx_tick = xTaskGetTickCount(); }
+
 void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
     if (!s_tx_queue || !data || len == 0) return;
     afsk_tx_frame_t f;
@@ -1064,9 +1069,14 @@ void receive_audio_task(void *arg) {
         // Dispatch any pending TX frame (queued by server_task via afsk_queue_tx_frame).
         // Running from this task, adc_continuous_stop/start honour the ESP-IDF mutex.
         if (!tx_mode && s_tx_queue && s_tx_fn) {
-            afsk_tx_frame_t f;
-            if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE) {
-                s_tx_fn(f.data, f.len);
+            bool inhibited = s_post_rx_tx_delay_ms > 0 && s_last_rx_tick != 0 &&
+                             (xTaskGetTickCount() - s_last_rx_tick) <
+                                 pdMS_TO_TICKS(s_post_rx_tx_delay_ms);
+            if (!inhibited) {
+                afsk_tx_frame_t f;
+                if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE) {
+                    s_tx_fn(f.data, f.len);
+                }
             }
         }
 

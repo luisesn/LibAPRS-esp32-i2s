@@ -175,6 +175,12 @@ void afsk_set_audio_hook(void (*fn)(int8_t));
 // #include-ing project headers from the library.
 void afsk_set_dispatch_hook(void (*fn)(void));
 
+// Post-RX TX inhibit window: prevents TX dispatch for N ms after the last
+// decoded AX.25 frame, giving the remote time to switch from TX to RX.
+// Call afsk_notify_rx_frame() on every decoded frame; 0 ms disables (default).
+void afsk_notify_rx_frame(void);
+void afsk_set_post_rx_tx_delay_ms(uint32_t ms);
+
 // DAC control primitives for non-AFSK TX modes (SSTV, Morse, etc.).
 void      afsk_switch_to_tx(void);
 void      afsk_switch_to_rx(void);
