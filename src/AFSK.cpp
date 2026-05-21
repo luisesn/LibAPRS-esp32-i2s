@@ -193,11 +193,52 @@ static void adc_peripheral_start(void) {
 
 // TX DMA chunk size — must equal dac_continuous buf_size (2048 bytes).
 // Each dac_continuous_write() fills exactly one DMA descriptor (≈42 ms at 48 kHz).
-// With desc_num=8, the pool is ≈336 ms — enough margin to survive WiFi task
-// preemptions (priority 23 vs. receive_audio_task priority 10). Writing less
-// than buf_size per call drains a descriptor in <1 ms, starving subsequent
-// writes and causing dac_continuous_write() to time out.
+// Writing less than buf_size per call drains a descriptor in <1 ms, starving
+// subsequent writes and causing dac_continuous_write() to time out.
 #define TX_SAMPLE_BUFLEN 2048
+
+// Number of DMA descriptors for the TX DAC pool.
+// 4 × 42 ms ≈ 168 ms — enough headroom for WiFi preemptions (priority 23,
+// typically ≤ 80 ms) while halving the worst-case TX→RX tail vs. the old 8.
+#define DAC_DESC_NUM  4u
+#define DAC_DESC_MS  42u   // approximate ms per 2048-byte descriptor at 48 kHz
+
+// ISR drain callback — fires once per consumed DMA descriptor.
+// Wakes the task blocked in wait_dac_drain() so it can exit as soon as
+// the last silence buffer plays out instead of sleeping a fixed 350 ms.
+static volatile TaskHandle_t s_drain_task = NULL;
+
+static bool IRAM_ATTR dac_on_convert_done(dac_continuous_handle_t hdl,
+                                           const dac_event_data_t  *evt,
+                                           void                    *arg)
+{
+    (void)hdl; (void)evt; (void)arg;
+    BaseType_t woken = pdFALSE;
+    TaskHandle_t t = (TaskHandle_t)s_drain_task;
+    if (t) vTaskNotifyGiveFromISR(t, &woken);
+    return woken == pdTRUE;
+}
+
+// Replace fixed vTaskDelay(350) with an event-driven wait.
+// Each step blocks until one descriptor plays out (~42 ms) or a 63 ms
+// timeout fires (meaning the DMA ran dry).  Exits after at most
+// DAC_DESC_NUM+1 steps — covering the full pipeline even if all
+// descriptors were loaded before sending ended.
+// Typical exit: 2–3 steps (~84–130 ms) instead of the fixed 350 ms.
+static void wait_dac_drain(void)
+{
+    // Discard any notifications that accumulated during the TX phase.
+    while (ulTaskNotifyTake(pdFALSE, 0)) {}
+
+    s_drain_task = xTaskGetCurrentTaskHandle();
+
+    const TickType_t step = pdMS_TO_TICKS(DAC_DESC_MS + DAC_DESC_MS / 2u); // ~63 ms
+    for (uint32_t i = 0; i < DAC_DESC_NUM + 1u; i++) {
+        if (!ulTaskNotifyTake(pdFALSE, step)) break;  // timeout = DMA empty
+    }
+
+    s_drain_task = NULL;
+}
 
 // Releases I2S0 from the ADC and hands it to the DAC for transmission.
 // Always called from receive_audio_task (the same task that started the ADC),
@@ -210,11 +251,11 @@ static void switch_to_tx(void) {
     adc_handle = NULL;
 
     // Brief delay to let I2S0 fully release before the DAC driver claims it.
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(5));
 
     dac_continuous_config_t dac_cfg = {
         .chan_mask = DAC_CHANNEL_MASK_CH0,
-        .desc_num  = 8,
+        .desc_num  = DAC_DESC_NUM,
         .buf_size  = 2048,
         .freq_hz   = CONFIG_AFSK_DAC_SAMPLERATE,
         .offset    = 0,
@@ -224,6 +265,15 @@ static void switch_to_tx(void) {
     ESP_ERROR_CHECK(dac_continuous_new_channels(&dac_cfg, &dac_handle));
     ESP_ERROR_CHECK(dac_continuous_enable(dac_handle));
     dac_enabled = true;
+
+    // Register drain callback — fires after each descriptor plays out.
+    // wait_dac_drain() uses task notifications from this ISR instead of
+    // a fixed 350 ms sleep.
+    {
+        dac_event_callbacks_t cbs = { .on_convert_done = dac_on_convert_done,
+                                      .on_stop         = NULL };
+        dac_continuous_register_event_callback(dac_handle, &cbs, NULL);
+    }
 
     // Prime the DMA with one full descriptor of silence so the I2S oscillator
     // is running before the first real audio write arrives.
@@ -441,11 +491,11 @@ void finish_transmission() {
         dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 2000);
     }
 
-    // Wait for the DMA to drain all queued descriptors before stopping the DAC.
-    // dac_continuous_disable() inside switch_to_rx() halts the DAC immediately;
-    // without this delay the tail silence is cut short → CRC failure at receiver.
-    // Worst case: desc_num(8) × buf_size(2048) / 48000 Hz ≈ 341 ms.
-    vTaskDelay(pdMS_TO_TICKS(350));
+    // Wait for the DMA pipeline to drain (tail silence played out) before
+    // stopping the DAC.  Replaces fixed 350 ms sleep with an event-driven
+    // wait: exits as soon as the last descriptor fires its callback, or
+    // after a 63 ms per-step timeout if the DMA goes dry early.
+    wait_dac_drain();
 
     gpio_set_level(GPIO_PTT_OUT, 0);  // release PTT: active-high → 0 = idle
 
@@ -479,7 +529,7 @@ void afsk_morse_tx_end(void) {
     memset(silence, 128, sizeof(silence));
     size_t bw = 0;
     dac_continuous_write(dac_handle, silence, sizeof(silence), &bw, 2000);
-    vTaskDelay(pdMS_TO_TICKS(350));
+    wait_dac_drain();
     gpio_set_level(GPIO_PTT_OUT, 0);  // PTT idle
     switch_to_rx();
 }
@@ -561,7 +611,15 @@ static bool hdlcParse(Hdlc *hdlc, bool bit, FIFOBuffer *fifo) {
     // Now we'll look at the last 8 received bits, and
     // check if we have received a HDLC flag (01111110)
     if (hdlc->demodulatedBits == HDLC_FLAG) {
-        if (s_cur_stats) s_cur_stats->hdlc_flags += 1;
+        if (s_cur_stats) {
+            s_cur_stats->hdlc_flags += 1;
+            // Track HDLC flags for v2 fast-phase-acquisition (Phase 1b).
+            // v2_hdlc_flags_seen was never incremented before this fix, causing
+            // v2 to permanently use PHASE_INC=2 (fast mode) instead of settling
+            // to PHASE_INC=1 after the preamble. Cap at 4 — that is the threshold.
+            if (s_cur_stats == &rx_stats_v2 && v2_hdlc_flags_seen < 4)
+                v2_hdlc_flags_seen++;
+        }
         // If we have, check that our output buffer is
         // not full.
         if (!fifo_isfull(fifo)) {

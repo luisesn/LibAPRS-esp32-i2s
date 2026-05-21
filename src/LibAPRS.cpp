@@ -23,6 +23,11 @@ static int     s_active_modem    = 2;
 static ax25_raw_callback_t s_app_raw_hook = NULL;
 
 // V1 shim: intercepts v1 CRC-OK frames for stats and arbiter filtering.
+// NOTE: In "best" mode (s_active_modem == 2) both v1 and v2 deliver frames
+// independently to s_app_raw_hook with NO deduplication. A packet decoded by
+// both modems will be forwarded TWICE to the KISS host (duplicate KISS frames).
+// This is intentional — the host should handle dedup if needed. Do not add
+// silent deduplication here without also adding sequence-number tracking.
 static void v1_raw_shim(const uint8_t *buf, size_t len) {
     rx_stats_v1.frames_crc_ok += 1;
     if (s_active_modem != 1 && s_app_raw_hook)  // deliver unless "v2-only" mode
