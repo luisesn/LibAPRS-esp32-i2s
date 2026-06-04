@@ -52,7 +52,7 @@ void APRS_msgRetry();
 // task. Safe to call from any task (e.g. HTTP handler). Uses afsk_queue_tx_frame
 // internally so it works correctly in KISS TNC mode.
 // to_ssid: 0-15, or -1 to omit the SSID suffix from the destination field.
-void APRS_queue_msg(const char *to_call, int to_ssid, const char *text);
+int  APRS_queue_msg(const char *to_call, int to_ssid, const char *text);
 // Queue an APRS ACK for a received message. msg_id is the numeric ID string
 // from the incoming {NNN} field (e.g. "042"). Builds ":DEST     :ackNNN".
 void APRS_queue_ack(const char *to_call, int to_ssid, const char *msg_id);

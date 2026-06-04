@@ -468,9 +468,9 @@ void APRS_getCallsign(char *buf_out, int *ssid_out)
     if (ssid_out) *ssid_out = CALL_SSID;
 }
 
-void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
+int APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
 {
-    if (!to_call || !text) return;
+    if (!to_call || !text) return -1;
     size_t text_len = strlen(text);
     if (text_len > 67) text_len = 67;
 
@@ -484,6 +484,7 @@ void APRS_queue_msg(const char *to_call, int to_ssid, const char *text)
     info[text_len + 2] = (char)('0' + (message_seq % 100) / 10);
     info[text_len + 3] = (char)('0' + message_seq % 10);
     queue_aprs_info(to_call, to_ssid, info, text_len + 4);
+    return message_seq;
 }
 
 void APRS_queue_ack(const char *to_call, int to_ssid, const char *msg_id)

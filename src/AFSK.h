@@ -180,6 +180,21 @@ void afsk_set_dispatch_hook(void (*fn)(void));
 // Call afsk_notify_rx_frame() on every decoded frame; 0 ms disables (default).
 void afsk_notify_rx_frame(void);
 void afsk_set_post_rx_tx_delay_ms(uint32_t ms);
+uint32_t afsk_get_post_rx_tx_delay_ms(void);
+
+// Listen-Before-Talk: register a channel-busy predicate (e.g. squelch_hfne_is_open).
+// TX dispatch is deferred while fn() returns true, up to lbt_max_wait_ms.
+// Config loaded automatically from config.json "tx.lbt_enabled" / "tx.lbt_max_wait_ms".
+void afsk_set_channel_busy_fn(bool (*fn)(void));
+void afsk_lbt_configure(bool enabled, uint32_t max_wait_ms);
+
+// Pause/resume AX.25 decoding (AFSK_adc_isr + APRS_poll).
+// Audio hook continues to fire — the repeater still receives samples.
+void afsk_pause_rx(bool pause);
+
+// Assert or release PTT (GPIO_PTT_OUT, active-high).
+// Use from non-AFSK TX modes (repeater, etc.) that call afsk_switch_to_tx/rx.
+void afsk_ptt_set(bool active);
 
 // DAC control primitives for non-AFSK TX modes (SSTV, Morse, etc.).
 void      afsk_switch_to_tx(void);

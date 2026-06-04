@@ -97,7 +97,23 @@ void afsk_set_dispatch_hook(void (*fn)(void)) { s_dispatch_hook = fn; }
 static uint32_t   s_post_rx_tx_delay_ms = 0;
 static TickType_t s_last_rx_tick        = 0;
 void afsk_set_post_rx_tx_delay_ms(uint32_t ms) { s_post_rx_tx_delay_ms = ms; }
+uint32_t afsk_get_post_rx_tx_delay_ms(void) { return s_post_rx_tx_delay_ms; }
 void afsk_notify_rx_frame(void) { s_last_rx_tick = xTaskGetTickCount(); }
+
+// Listen-Before-Talk: defer TX while channel is busy, up to lbt_max_wait_ms.
+static bool       s_lbt_enabled     = false;
+static uint32_t   s_lbt_max_wait_ms = 10000;
+static bool     (*s_channel_busy_fn)(void) = NULL;
+static TickType_t s_lbt_defer_start = 0;
+
+void afsk_set_channel_busy_fn(bool (*fn)(void)) { s_channel_busy_fn = fn; }
+void afsk_lbt_configure(bool enabled, uint32_t max_wait_ms) {
+    s_lbt_enabled     = enabled;
+    s_lbt_max_wait_ms = max_wait_ms ? max_wait_ms : 10000;
+}
+
+static volatile bool s_rx_paused = false;
+void afsk_pause_rx(bool pause) { s_rx_paused = pause; }
 
 void afsk_queue_tx_frame(const uint8_t *data, size_t len) {
     if (!s_tx_queue || !data || len == 0) return;
@@ -115,7 +131,7 @@ extern void APRS_poll(void);
 static void aprs_poll_task(void *arg) {
     (void)arg;
     for (;;) {
-        APRS_poll();
+        if (!s_rx_paused) APRS_poll();
         vTaskDelay(1);
     }
 }
@@ -299,6 +315,10 @@ static void switch_to_tx(void) {
 }
 
 extern "C" void afsk_switch_to_tx(void) { switch_to_tx(); }
+extern "C" void afsk_ptt_set(bool active) {
+    gpio_set_direction(GPIO_PTT_OUT, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_PTT_OUT, active ? 1 : 0);
+}
 
 // Returns I2S0 to the ADC after transmission completes.
 static void switch_to_rx(void) {
@@ -351,6 +371,15 @@ void AFSK_hw_init(void) {
             if (cJSON_IsNumber(it)) s_squelch_threshold = (int)it->valuedouble;
             it = cJSON_GetObjectItem(rx, "deemphasis_enabled");
             if (cJSON_IsBool(it)) s_deemphasis_enabled = cJSON_IsTrue(it);
+        }
+        cJSON *tx_obj = cJSON_GetObjectItem(cfg, "tx");
+        if (tx_obj) {
+            cJSON *it;
+            it = cJSON_GetObjectItem(tx_obj, "lbt_enabled");
+            if (cJSON_IsBool(it)) s_lbt_enabled = cJSON_IsTrue(it);
+            it = cJSON_GetObjectItem(tx_obj, "lbt_max_wait_ms");
+            if (cJSON_IsNumber(it) && it->valueint > 0)
+                s_lbt_max_wait_ms = (uint32_t)it->valueint;
         }
     }
 
@@ -1072,11 +1101,29 @@ void receive_audio_task(void *arg) {
             bool inhibited = s_post_rx_tx_delay_ms > 0 && s_last_rx_tick != 0 &&
                              (xTaskGetTickCount() - s_last_rx_tick) <
                                  pdMS_TO_TICKS(s_post_rx_tx_delay_ms);
+            if (inhibited) {
+                // Post-RX window: don't count this time against the LBT timer.
+                s_lbt_defer_start = 0;
+            } else if (s_lbt_enabled && s_channel_busy_fn && s_channel_busy_fn()) {
+                if (s_lbt_defer_start == 0) {
+                    s_lbt_defer_start = xTaskGetTickCount();
+                    ESP_LOGI("AFSK", "LBT: channel busy, deferring TX");
+                }
+                TickType_t waited = xTaskGetTickCount() - s_lbt_defer_start;
+                if (waited < pdMS_TO_TICKS(s_lbt_max_wait_ms)) {
+                    inhibited = true;
+                } else {
+                    ESP_LOGW("AFSK", "LBT: max wait %lums exceeded, transmitting anyway",
+                             (unsigned long)s_lbt_max_wait_ms);
+                    s_lbt_defer_start = 0;
+                }
+            } else {
+                s_lbt_defer_start = 0;  // channel clear or LBT disabled
+            }
             if (!inhibited) {
                 afsk_tx_frame_t f;
-                if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE) {
+                if (xQueueReceive(s_tx_queue, &f, 0) == pdTRUE)
                     s_tx_fn(f.data, f.len);
-                }
             }
         }
 
@@ -1122,11 +1169,11 @@ void receive_audio_task(void *arg) {
                 int8_t sample = adc_to_s8(avg12);
                 int8_t a = sample < 0 ? -sample : sample;
                 if (a > audio_peak) audio_peak = a;
-                AFSK_adc_isr(AFSK_modem, sample);
+                if (!s_rx_paused) AFSK_adc_isr(AFSK_modem, sample);
                 if (s_audio_hook) s_audio_hook(sample);
 
                 // V2 path: FIR decimation + AGC + squelch
-                if (AFSK_modem_v2) {
+                if (!s_rx_paused && AFSK_modem_v2) {
                     int32_t acc = 0;
                     for (int k = 0; k < OVERSAMPLING; k++)
                         acc += (int32_t)fir5[k] * v2_fir_buf[k];
