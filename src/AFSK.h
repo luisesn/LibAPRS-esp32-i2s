@@ -95,6 +95,7 @@ typedef struct Afsk
     uint8_t txBuf[CONFIG_AFSK_TX_BUFLEN];   // Actial data storage for said FIFO
 
     volatile bool sending;                  // Set when modem is sending
+    bool il2p_tx;                           // IL2P TX: disables bit-stuffing
 
     // Demodulation values
     FIFOBuffer delayFifo;                   // Delayed FIFO for frequency discrimination

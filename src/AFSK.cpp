@@ -24,6 +24,12 @@ Afsk *AFSK_modem;
 Afsk *AFSK_modem_v2 = NULL;
 static Afsk afsk_v2_instance;
 
+// IL2P enable flag (read from config.json "il2p" section)
+static bool s_il2p_enabled = false;
+
+extern "C" void il2p_rx_bit(uint8_t modem_id, uint8_t nrzi_bit);
+extern "C" void il2p_poll(void);
+
 // Runtime config for dual modem (read from config.json "rx" section)
 static bool s_dual_modem_enabled = false;
 static int  s_squelch_threshold  = 64;
@@ -131,7 +137,10 @@ extern void APRS_poll(void);
 static void aprs_poll_task(void *arg) {
     (void)arg;
     for (;;) {
-        if (!s_rx_paused) APRS_poll();
+        if (!s_rx_paused) {
+            APRS_poll();
+            il2p_poll();
+        }
         vTaskDelay(1);
     }
 }
@@ -372,6 +381,11 @@ void AFSK_hw_init(void) {
             it = cJSON_GetObjectItem(rx, "deemphasis_enabled");
             if (cJSON_IsBool(it)) s_deemphasis_enabled = cJSON_IsTrue(it);
         }
+        cJSON *il2p_obj = cJSON_GetObjectItem(cfg, "il2p");
+        if (il2p_obj) {
+            cJSON *en = cJSON_GetObjectItem(il2p_obj, "enabled");
+            if (cJSON_IsBool(en)) s_il2p_enabled = cJSON_IsTrue(en);
+        }
         cJSON *tx_obj = cJSON_GetObjectItem(cfg, "tx");
         if (tx_obj) {
             cJSON *it;
@@ -599,6 +613,8 @@ uint8_t AFSK_dac_isr(Afsk *afsk) {
                     } else {
                         afsk->currentOutputByte = fifo_pop(&afsk->txFifo);
                     }
+                } else if (afsk->il2p_tx) {
+                    afsk->bitStuff = false;  /* IL2P uses LFSR scrambling, no bit-stuffing */
                 } else if (afsk->currentOutputByte == HDLC_FLAG || afsk->currentOutputByte == HDLC_RESET) {
                     afsk->bitStuff = false;
                 }
@@ -922,6 +938,9 @@ void AFSK_adc_isr(Afsk *afsk, int8_t currentSample) {
                 afsk->status = 0;
             }
         }
+        if (s_il2p_enabled) {
+            il2p_rx_bit(0, (uint8_t)(!TRANSITION_FOUND(afsk->actualBits)));
+        }
     }
 
 }
@@ -1065,6 +1084,9 @@ static void afsk_v2_process(Afsk *afsk, int8_t currentSample) {
                 fifo_flush(&afsk->rxFifo);
                 afsk->status = 0;
             }
+        }
+        if (s_il2p_enabled) {
+            il2p_rx_bit(1, (uint8_t)(!TRANSITION_FOUND(afsk->actualBits)));
         }
         // Reset fast-sync counter when a frame ends
         if (was_receiving && !afsk->hdlc.receiving)
